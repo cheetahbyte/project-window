@@ -50,3 +50,8 @@ target_link_libraries(compositor PRIVATE protocol
 
 add_executable(demo-client src/demo-client/main.cpp)
 target_link_libraries(demo-client PRIVATE clientkit)
+
+add_executable(capture-scene src/capture-scene/main.cpp)
+target_link_libraries(capture-scene PRIVATE "-framework CoreGraphics" "-framework CoreFoundation")
+
+add_executable(bench src/bench/main.cpp)

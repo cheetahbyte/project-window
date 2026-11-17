@@ -20,10 +20,14 @@ enum class MessageId : mach_msg_id_t {
     AttachBuffer,
     Commit,
     DestroyWindow,
+    SetMapped,
+    MoveWindow,
+    Sync,
 
     Welcome = 2000,
     Configure,
     Input,
+    Synced,
 };
 
 enum class PointerPhase : std::uint32_t { Down, Move, Up };
@@ -69,6 +73,29 @@ struct DestroyWindow {
     std::uint32_t window;
 };
 
+// An unmapped window keeps its buffer but is neither drawn nor given input. Windows start
+// mapped; mapped must be 0 or 1.
+struct SetMapped {
+    static constexpr MessageId id = MessageId::SetMapped;
+    static constexpr bool carries_port = false;
+    std::uint32_t window;
+    std::uint32_t mapped;
+};
+
+struct MoveWindow {
+    static constexpr MessageId id = MessageId::MoveWindow;
+    static constexpr bool carries_port = false;
+    std::uint32_t window;
+    std::int32_t x, y;
+};
+
+// Answered with Synced carrying the same serial once everything sent before it is processed.
+struct Sync {
+    static constexpr MessageId id = MessageId::Sync;
+    static constexpr bool carries_port = false;
+    std::uint32_t serial;
+};
+
 // Server to client. Welcome carries the port for this connection.
 
 struct Welcome {
@@ -90,6 +117,12 @@ struct Input {
     std::uint32_t window;
     PointerPhase phase;
     float x, y;
+};
+
+struct Synced {
+    static constexpr MessageId id = MessageId::Synced;
+    static constexpr bool carries_port = false;
+    std::uint32_t serial;
 };
 
 template <class Payload>

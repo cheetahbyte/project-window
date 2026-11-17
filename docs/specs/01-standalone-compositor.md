@@ -66,6 +66,9 @@ Client to server:
 | `attachBuffer` | window id, IOSurface port |
 | `commit` | window id, damage rectangle in pixels |
 | `destroyWindow` | window id |
+| `setMapped` | window id, mapped or not; an unmapped window keeps its buffer but is not drawn |
+| `moveWindow` | window id, new origin |
+| `sync` | serial |
 
 Server to client:
 
@@ -75,6 +78,7 @@ Server to client:
 | `configure` | window id, new frame |
 | `visibility` | window id, visible or hidden |
 | `input` | window id, pointer event in window coordinates |
+| `synced` | serial of the `sync` it answers, sent once everything before that `sync` is processed |
 
 Window ids are chosen by the client and scoped to its connection, so creating a window needs no round trip.
 

@@ -205,6 +205,39 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
         return true;
     }
 
+    if (std::optional<Received<SetMapped>> set = message.take<SetMapped>()) {
+        const WindowKey key{connection, set->payload.window};
+        Window* window = scene_.find(key);
+        if (!window || set->payload.mapped > 1) return false;
+        const bool mapped{set->payload.mapped == 1};
+        if (window->mapped == mapped) return true;
+        window->mapped = mapped;
+        if (!mapped) {
+            if (drag_ && drag_->key == key) drag_.reset();
+            if (pointer_target_ == key) pointer_target_.reset();
+        }
+        on_damage_();
+        return true;
+    }
+
+    if (std::optional<Received<MoveWindow>> move = message.take<MoveWindow>()) {
+        const WindowKey key{connection, move->payload.window};
+        Window* window = scene_.find(key);
+        if (!window) return false;
+        Rect moved{window->frame};
+        moved.x = move->payload.x;
+        moved.y = move->payload.y;
+        if (!valid_frame(moved)) return false;
+        window->frame = moved;
+        if (window->mapped && textures_.contains(key)) on_damage_();
+        return true;
+    }
+
+    if (std::optional<Received<Sync>> sync = message.take<Sync>()) {
+        post_event(connections_.at(connection).events, Synced{.serial = sync->payload.serial});
+        return true;
+    }
+
     return false;
 }
 

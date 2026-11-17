@@ -21,6 +21,7 @@ struct Window {
     WindowKey key{};
     Rect frame{};
     std::uint32_t scale{};
+    bool mapped{true};
 };
 
 // The windows on the display, in stacking order. Coordinates are points, origin top left.

@@ -7,7 +7,7 @@ namespace pw {
 
 bool Scene::add(WindowKey key, Rect frame, std::uint32_t scale) {
     if (find(key)) return false;
-    windows_.push_back({key, frame, scale});
+    windows_.push_back({.key = key, .frame = frame, .scale = scale});
     return true;
 }
 
@@ -32,6 +32,7 @@ Window* Scene::find(WindowKey key) {
 
 Window* Scene::top_at(float x, float y) {
     for (Window& window : windows_ | std::views::reverse) {
+        if (!window.mapped) continue;
         const Rect& frame = window.frame;
         const float left{static_cast<float>(frame.x)};
         const float top{static_cast<float>(frame.y)};

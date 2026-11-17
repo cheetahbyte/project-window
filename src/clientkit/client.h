@@ -1,7 +1,7 @@
 #pragma once
 
 #include "protocol/messages.h"
-#include "protocol/ports.h"
+#include "protocol/transport.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -75,6 +76,12 @@ public:
     [[nodiscard]] Result<void> attach_buffer(std::uint32_t window, const Surface& surface);
     [[nodiscard]] Result<void> commit(std::uint32_t window, Rect damage);
     [[nodiscard]] Result<void> destroy_window(std::uint32_t window);
+    [[nodiscard]] Result<void> set_mapped(std::uint32_t window, bool mapped);
+    [[nodiscard]] Result<void> move_window(std::uint32_t window, std::int32_t x, std::int32_t y);
+
+    // Waits until the server has processed everything sent so far. Events that arrive
+    // meanwhile are kept for next_event.
+    [[nodiscard]] Result<void> sync(std::chrono::milliseconds timeout);
 
     // Waits for the next event; without a timeout it waits indefinitely. Returns nothing when
     // the wait timed out or an unknown message was skipped.
@@ -85,8 +92,12 @@ private:
     Client(SendRight connection, ReceiveRight events)
         : connection_{std::move(connection)}, events_{std::move(events)} {}
 
+    [[nodiscard]] std::optional<Event> decode(Message& message);
+
     SendRight connection_;
     ReceiveRight events_;
+    std::deque<Event> pending_;
+    std::uint32_t next_serial_{1};
 };
 
 }  // namespace pw

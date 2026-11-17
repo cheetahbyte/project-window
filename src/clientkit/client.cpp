@@ -123,12 +123,52 @@ Result<void> Client::destroy_window(std::uint32_t window) {
     return send(connection_, DestroyWindow{.window = window});
 }
 
+Result<void> Client::set_mapped(std::uint32_t window, bool mapped) {
+    return send(connection_, SetMapped{.window = window, .mapped = mapped ? 1U : 0U});
+}
+
+Result<void> Client::move_window(std::uint32_t window, std::int32_t x, std::int32_t y) {
+    return send(connection_, MoveWindow{.window = window, .x = x, .y = y});
+}
+
+Result<void> Client::sync(std::chrono::milliseconds timeout) {
+    const std::uint32_t serial{next_serial_++};
+    if (const Result<void> sent = send(connection_, Sync{.serial = serial}); !sent) return sent;
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::milliseconds{0}) return std::unexpected{MACH_RCV_TIMED_OUT};
+        Result<Message> message = receive(events_.name(), remaining);
+        if (!message) return std::unexpected{message.error()};
+        if (const auto synced = message->take<Synced>()) {
+            if (synced->payload.serial == serial) return {};
+            continue;
+        }
+        if (std::optional<Event> event = decode(*message)) {
+            const bool disconnected{std::holds_alternative<Disconnected>(*event)};
+            pending_.push_back(*event);
+            if (disconnected) return std::unexpected{MACH_SEND_INVALID_DEST};
+        }
+    }
+}
+
 std::optional<Event> Client::next_event(std::optional<std::chrono::milliseconds> timeout) {
+    if (!pending_.empty()) {
+        const Event event{pending_.front()};
+        pending_.pop_front();
+        return event;
+    }
     Result<Message> message = receive(events_.name(), timeout);
     if (!message) return std::nullopt;
-    if (const auto configure = message->take<Configure>()) return configure->payload;
-    if (const auto input = message->take<Input>()) return input->payload;
-    if (message->id() == MACH_NOTIFY_DEAD_NAME) {
+    return decode(*message);
+}
+
+std::optional<Event> Client::decode(Message& message) {
+    if (const auto configure = message.take<Configure>()) return configure->payload;
+    if (const auto input = message.take<Input>()) return input->payload;
+    if (message.id() == MACH_NOTIFY_DEAD_NAME) {
         // The notification adds one user reference to the dead name; drop it so that connection_
         // is left with exactly the one reference it owns and releases on destruction.
         static_cast<void>(mach_port_deallocate(mach_task_self(), connection_.name()));
