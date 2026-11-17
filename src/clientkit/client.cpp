@@ -4,6 +4,9 @@
 
 #include <IOSurface/IOSurface.h>
 #include <mach/notify.h>
+#include <servers/bootstrap.h>
+
+#include <thread>
 
 namespace pw {
 
@@ -11,6 +14,22 @@ namespace {
 
 constexpr std::int32_t kPixelFormatBGRA = 0x42475241;
 constexpr auto kHandshakeTimeout = std::chrono::milliseconds{2000};
+constexpr auto kStartupWait = std::chrono::milliseconds{3000};
+constexpr auto kStartupPoll = std::chrono::milliseconds{50};
+
+// A client launched alongside the compositor can run before the service name is published,
+// so an unknown name is retried for a short while.
+[[nodiscard]] Result<SendRight> look_up_compositor() {
+    const auto deadline = std::chrono::steady_clock::now() + kStartupWait;
+    for (;;) {
+        Result<SendRight> service = look_up_service(kServiceName);
+        if (service || service.error() != BOOTSTRAP_UNKNOWN_SERVICE ||
+            std::chrono::steady_clock::now() >= deadline) {
+            return service;
+        }
+        std::this_thread::sleep_for(kStartupPoll);
+    }
+}
 
 [[nodiscard]] bool set_number(CFMutableDictionaryRef dictionary, CFStringRef key,
                               std::int32_t value) {
@@ -63,7 +82,7 @@ Surface::UnlockGuard::~UnlockGuard() {
 }
 
 Result<Client> Client::connect() {
-    const Result<SendRight> service = look_up_service(kServiceName);
+    const Result<SendRight> service = look_up_compositor();
     if (!service) return std::unexpected{service.error()};
     Result<ReceiveRight> events = ReceiveRight::allocate();
     if (!events) return std::unexpected{events.error()};
