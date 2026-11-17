@@ -1,0 +1,121 @@
+#include "clientkit/client.h"
+
+#include "protocol/transport.h"
+
+#include <IOSurface/IOSurface.h>
+#include <mach/notify.h>
+
+namespace pw {
+
+namespace {
+
+constexpr std::int32_t kPixelFormatBGRA = 0x42475241;
+constexpr auto kHandshakeTimeout = std::chrono::milliseconds{2000};
+
+[[nodiscard]] bool set_number(CFMutableDictionaryRef dictionary, CFStringRef key,
+                              std::int32_t value) {
+    const CfOwner<CFNumberRef> number{CFNumberCreate(nullptr, kCFNumberSInt32Type, &value)};
+    if (!number) return false;
+    CFDictionarySetValue(dictionary, key, number.get());
+    return true;
+}
+
+}  // namespace
+
+std::optional<Surface> Surface::create(int width, int height) {
+    const CfOwner<CFMutableDictionaryRef> properties{CFDictionaryCreateMutable(
+        nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks)};
+    if (!properties) return std::nullopt;
+    if (!set_number(properties.get(), kIOSurfaceWidth, width) ||
+        !set_number(properties.get(), kIOSurfaceHeight, height) ||
+        !set_number(properties.get(), kIOSurfaceBytesPerElement, 4) ||
+        !set_number(properties.get(), kIOSurfacePixelFormat, kPixelFormatBGRA)) {
+        return std::nullopt;
+    }
+    CfOwner<IOSurfaceRef> surface{IOSurfaceCreate(properties.get())};
+    if (!surface) return std::nullopt;
+    return Surface{std::move(surface)};
+}
+
+int Surface::width() const {
+    return static_cast<int>(IOSurfaceGetWidth(surface_.get()));
+}
+
+int Surface::height() const {
+    return static_cast<int>(IOSurfaceGetHeight(surface_.get()));
+}
+
+std::size_t Surface::stride() const {
+    return IOSurfaceGetBytesPerRow(surface_.get()) / sizeof(std::uint32_t);
+}
+
+std::span<std::uint32_t> Surface::pixels() const {
+    auto* base = static_cast<std::uint32_t*>(IOSurfaceGetBaseAddress(surface_.get()));
+    return {base, stride() * IOSurfaceGetHeight(surface_.get())};
+}
+
+Result<void> Surface::lock() {
+    return as_result(IOSurfaceLock(surface_.get(), 0, nullptr));
+}
+
+Surface::UnlockGuard::~UnlockGuard() {
+    IOSurfaceUnlock(surface, 0, nullptr);
+}
+
+Result<Client> Client::connect() {
+    const Result<SendRight> service = look_up_service(kServiceName);
+    if (!service) return std::unexpected{service.error()};
+    Result<ReceiveRight> events = ReceiveRight::allocate();
+    if (!events) return std::unexpected{events.error()};
+
+    if (const Result<void> sent = send(*service, Hello{.version = kProtocolVersion}, *events);
+        !sent) {
+        return std::unexpected{sent.error()};
+    }
+
+    Result<Message> reply = receive(events->name(), kHandshakeTimeout);
+    if (!reply) return std::unexpected{reply.error()};
+    std::optional<Received<Welcome>> welcome = reply->take<Welcome>();
+    if (!welcome || welcome->payload.version != kProtocolVersion) {
+        return std::unexpected{KERN_FAILURE};
+    }
+
+    if (const Result<void> watched = notify_when_dead(welcome->port, *events); !watched) {
+        return std::unexpected{watched.error()};
+    }
+    return Client{std::move(welcome->port), *std::move(events)};
+}
+
+Result<void> Client::create_window(std::uint32_t window, Rect frame, std::uint32_t scale) {
+    return send(connection_, CreateWindow{.window = window, .frame = frame, .scale = scale});
+}
+
+Result<void> Client::attach_buffer(std::uint32_t window, const Surface& surface) {
+    const mach_port_t port = IOSurfaceCreateMachPort(surface.get());
+    if (!MACH_PORT_VALID(port)) return std::unexpected{KERN_FAILURE};
+    return send(connection_, AttachBuffer{.window = window}, SendRight::adopt(port));
+}
+
+Result<void> Client::commit(std::uint32_t window, Rect damage) {
+    return send(connection_, Commit{.window = window, .damage = damage});
+}
+
+Result<void> Client::destroy_window(std::uint32_t window) {
+    return send(connection_, DestroyWindow{.window = window});
+}
+
+std::optional<Event> Client::next_event(std::optional<std::chrono::milliseconds> timeout) {
+    Result<Message> message = receive(events_.name(), timeout);
+    if (!message) return std::nullopt;
+    if (const auto configure = message->take<Configure>()) return configure->payload;
+    if (const auto input = message->take<Input>()) return input->payload;
+    if (message->id() == MACH_NOTIFY_DEAD_NAME) {
+        // The notification adds one user reference to the dead name; drop it so that connection_
+        // is left with exactly the one reference it owns and releases on destruction.
+        static_cast<void>(mach_port_deallocate(mach_task_self(), connection_.name()));
+        return Disconnected{};
+    }
+    return std::nullopt;
+}
+
+}  // namespace pw

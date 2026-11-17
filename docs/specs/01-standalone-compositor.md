@@ -33,7 +33,7 @@ The profile points at two levers: which buffers are kept for windows nobody can 
 
 ## Architecture
 
-C++23, built with CMake (Makefile generator; Ninja is not installed). AppKit and Metal are Objective-C interfaces, so the window and the renderer are Objective-C++ files; everything else is plain C++. No dependencies beyond the macOS SDK.
+C++23, built with CMake (Makefile generator; Ninja is not installed) with `-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`. `-DPW_SANITIZE=ON` adds AddressSanitizer and UndefinedBehaviorSanitizer; benchmarks use a build without them. AppKit and Metal are Objective-C interfaces, so the window and the renderer are Objective-C++ files; everything else is plain C++. No dependencies beyond the macOS SDK.
 
 Three executables and two static libraries.
 
@@ -71,6 +71,7 @@ Server to client:
 
 | Message | Payload |
 |---|---|
+| `welcome` | port for this connection; the client sends everything after `hello` to it |
 | `configure` | window id, new frame |
 | `visibility` | window id, visible or hidden |
 | `input` | window id, pointer event in window coordinates |

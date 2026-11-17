@@ -1,0 +1,80 @@
+#pragma once
+
+#import <Metal/Metal.h>
+
+#include "compositor/scene.h"
+#include "protocol/transport.h"
+
+#include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stop_token>
+#include <thread>
+
+namespace pw {
+
+// Owns the client connections and the scene. Everything except the receive thread runs on
+// the main thread.
+class Server {
+public:
+    Server(id<MTLDevice> device, std::function<void()> on_damage);
+    ~Server();
+    Server(const Server&) = delete;
+    Server& operator=(const Server&) = delete;
+
+    [[nodiscard]] Result<void> start();
+
+    const Scene& scene() const { return scene_; }
+    id<MTLTexture> texture(WindowKey key) const;
+
+    void pointer(PointerPhase phase, float x, float y);
+
+private:
+    struct Drag {
+        WindowKey key{};
+        float offset_x{};
+        float offset_y{};
+    };
+
+    struct Connection {
+        ReceiveRight port;
+        SendRight events;
+    };
+
+    // Messages handed from the receive thread to the main thread.
+    struct Inbox {
+        std::mutex mutex;
+        std::deque<Message> messages;
+        bool wake_pending{false};
+    };
+
+    void receive_loop(std::stop_token stop, mach_port_t port_set);
+    void post(Message message);
+    void drain();
+    void handle(Message message);
+    void accept(SendRight events);
+    bool dispatch(mach_port_t connection, Message& message);
+    void close(mach_port_t connection);
+    id<MTLTexture> make_texture(const SendRight& surface_port, const Window& window);
+    void send_input(WindowKey key, PointerPhase phase, float x, float y);
+
+    id<MTLDevice> device_;
+    std::function<void()> on_damage_;
+    ReceiveRight service_;
+    SendRight wake_;
+    PortSet port_set_;
+
+    Scene scene_;
+    std::map<mach_port_t, Connection> connections_;
+    std::map<WindowKey, id<MTLTexture>> textures_;
+    std::optional<Drag> drag_;
+    std::optional<WindowKey> pointer_target_;
+
+    std::shared_ptr<Inbox> inbox_{std::make_shared<Inbox>()};
+    std::jthread receiver_;
+};
+
+}  // namespace pw
