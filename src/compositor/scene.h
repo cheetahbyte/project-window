@@ -23,6 +23,8 @@ struct Window {
     WindowKey key{};
     Rect frame{};
     std::uint32_t scale{};
+    // The part guaranteed opaque, in window points and within the frame; may have no area.
+    Rect opaque{};
     bool mapped{true};
     // Whether the server keeps a buffer for the window and tells its client to draw.
     bool visible{true};

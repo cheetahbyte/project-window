@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "compositor/display.h"
+#include "compositor/effects.h"
 #include "compositor/occlusion.h"
 #include "compositor/region.h"
 #include "compositor/scene.h"
@@ -43,7 +44,8 @@ struct RevealStats {
 // the main thread.
 class Server {
 public:
-    Server(id<MTLDevice> device, ReleasePolicy policy, std::function<void()> on_damage);
+    Server(id<MTLDevice> device, ReleasePolicy policy, EffectSet effects,
+           std::function<void()> on_damage);
     ~Server();
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
@@ -52,9 +54,12 @@ public:
 
     const Scene& scene() const { return scene_; }
     id<MTLTexture> texture(WindowKey key) const;
-    // The window's buffer if the window is drawn, otherwise nil. Drawn windows are opaque
-    // and hide what lies below them.
+    // The window's buffer if the window is drawn, otherwise nil. Of a drawn window, the part
+    // opaque_pixels names hides what lies below it.
     id<MTLTexture> drawn_texture(const Window& window) const;
+    // The part of the window treated as opaque, in display pixels; the whole frame when alpha
+    // is off. May have no area. Requires a display.
+    Rect opaque_pixels(const Window& window) const;
 
     void pointer(PointerPhase phase, float x, float y);
     // Call when the display is created and whenever its size or scale changes.
@@ -106,6 +111,7 @@ private:
 
     id<MTLDevice> device_;
     ReleasePolicy policy_;
+    EffectSet effects_;
     std::function<void()> on_damage_;
     ReceiveRight service_;
     SendRight wake_;

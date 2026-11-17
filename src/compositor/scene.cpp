@@ -7,7 +7,10 @@ namespace pw {
 
 bool Scene::add(WindowKey key, Rect frame, std::uint32_t scale) {
     if (find(key)) return false;
-    windows_.push_back({.key = key, .frame = frame, .scale = scale});
+    windows_.push_back({.key = key,
+                        .frame = frame,
+                        .scale = scale,
+                        .opaque = Rect{0, 0, frame.width, frame.height}});
     return true;
 }
 

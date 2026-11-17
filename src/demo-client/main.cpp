@@ -34,14 +34,33 @@ constexpr int kMaxScale = 4;
 constexpr int kMaxSliceCount = 1000;
 constexpr std::size_t kMaxSceneWindows = 100000;
 constexpr std::string_view kUsage =
-    "usage: demo-client [--windows N] [--animate] | --scene PATH [--slice I/N] [--animate] "
+    "usage: demo-client [--windows N] [--animate] [--translucent] | --scene PATH [--slice I/N] [--animate] "
     "[--animate-top | --orbit-top | --blink-top]\n";
 constexpr std::array<std::uint32_t, 6> kPalette = {0xFF3B82F6, 0xFF10B981, 0xFFF59E0B,
                                                    0xFFEF4444, 0xFF8B5CF6, 0xFF14B8A6};
 
+constexpr std::uint32_t kOpaqueAlpha = 255;
+constexpr std::uint32_t kTranslucentBodyAlpha = 153;
+constexpr std::uint32_t kOverlayAlpha = 38;
+constexpr std::uint32_t kChannelMask = 0xFF;
+constexpr unsigned kChannelBits = 8;
+
 constexpr std::uint32_t darken(std::uint32_t colour) {
     return 0xFF000000 | ((colour >> 1) & 0x007F7F7F);
 }
+
+// Takes the colour channels of colour, ignores its alpha, and returns them premultiplied
+// by alpha (0..255) with the alpha byte set to alpha.
+constexpr std::uint32_t premultiply(std::uint32_t colour, std::uint32_t alpha) {
+    std::uint32_t result = alpha << (3 * kChannelBits);
+    for (unsigned shift = 0; shift < 3 * kChannelBits; shift += kChannelBits) {
+        const std::uint32_t channel = (colour >> shift) & kChannelMask;
+        result |= ((channel * alpha + kOpaqueAlpha / 2) / kOpaqueAlpha) << shift;
+    }
+    return result;
+}
+
+enum class Opacity { Opaque, TranslucentBody, Overlay };
 
 struct DemoWindow {
     std::uint32_t id;
@@ -53,6 +72,37 @@ struct DemoWindow {
     std::uint32_t scale = kDefaultScale;
     int bar_x = 0;
     bool animated = false;
+    Opacity opacity = Opacity::Opaque;
+
+    [[nodiscard]] std::uint32_t title_alpha() const {
+        return opacity == Opacity::Overlay ? kOverlayAlpha : kOpaqueAlpha;
+    }
+
+    [[nodiscard]] std::uint32_t body_alpha() const {
+        switch (opacity) {
+        case Opacity::Opaque: return kOpaqueAlpha;
+        case Opacity::TranslucentBody: return kTranslucentBodyAlpha;
+        case Opacity::Overlay: return kOverlayAlpha;
+        }
+        throw std::logic_error{"unknown opacity"};
+    }
+
+    [[nodiscard]] std::uint32_t title_colour() const {
+        return premultiply(darken(kPalette.at(colour)), title_alpha());
+    }
+
+    [[nodiscard]] std::uint32_t body_colour() const {
+        return premultiply(kPalette.at(colour), body_alpha());
+    }
+
+    [[nodiscard]] pw::Rect opaque_rect() const {
+        switch (opacity) {
+        case Opacity::Opaque: return {0, 0, frame.width, frame.height};
+        case Opacity::TranslucentBody: return {0, 0, frame.width, std::min(kTitleBarHeight, frame.height)};
+        case Opacity::Overlay: return {0, 0, 0, 0};
+        }
+        throw std::logic_error{"unknown opacity"};
+    }
 
     [[nodiscard]] pw::Result<void> fill(pw::Rect area, std::uint32_t colour_value) {
         if (!surface) return {};
@@ -84,11 +134,11 @@ struct DemoWindow {
 
     [[nodiscard]] pw::Result<pw::Rect> paint() {
         const pw::Rect content = body();
-        if (auto filled = fill({0, 0, buffer_width, content.y}, darken(kPalette.at(colour)));
+        if (auto filled = fill({0, 0, buffer_width, content.y}, title_colour());
             !filled) {
             return std::unexpected{filled.error()};
         }
-        if (auto filled = fill(content, kPalette.at(colour)); !filled) {
+        if (auto filled = fill(content, body_colour()); !filled) {
             return std::unexpected{filled.error()};
         }
         return pw::Rect{0, 0, buffer_width, buffer_height};
@@ -99,8 +149,7 @@ struct DemoWindow {
         const pw::Rect content = body();
         const int previous = bar_x;
         bar_x = (bar_x + 8) % (content.width - kBarWidth);
-        if (auto filled = fill({previous, content.y, kBarWidth, content.height},
-                               kPalette.at(colour));
+        if (auto filled = fill({previous, content.y, kBarWidth, content.height}, body_colour());
             !filled) {
             return std::unexpected{filled.error()};
         }
@@ -136,6 +185,7 @@ struct Options {
     int count{3};
     bool animate{false};
     bool windows_given{false};
+    bool translucent{false};
     std::optional<std::string> scene_path;
     std::optional<Slice> slice;
     TopMode top{TopMode::None};
@@ -178,6 +228,8 @@ std::optional<Options> parse_options(std::span<char*> arguments) {
         const bool has_value = index + 1 < arguments.size();
         if (argument == "--animate") {
             options.animate = true;
+        } else if (argument == "--translucent") {
+            options.translucent = true;
         } else if (argument == "--animate-top" || argument == "--orbit-top" ||
                    argument == "--blink-top") {
             if (options.top != TopMode::None) return std::nullopt;
@@ -200,6 +252,8 @@ std::optional<Options> parse_options(std::span<char*> arguments) {
     }
     if (!options.scene_path) {
         if (options.slice || options.top != TopMode::None) return std::nullopt;
+    } else if (options.translucent) {
+        return std::nullopt;
     } else if (options.windows_given ||
                (options.animate && options.top != TopMode::None)) {
         return std::nullopt;
@@ -358,6 +412,11 @@ int main(int argc, char** argv) {
             window.animated = options->animate;
         }
         window.animated = window.animated && window.can_animate();
+        if (options->scene_path) {
+            if (entry.layer > 0) window.opacity = Opacity::Overlay;
+        } else if (options->translucent) {
+            window.opacity = Opacity::TranslucentBody;
+        }
         if (entry.mapped) {
             window.surface = pw::Surface::create(window.buffer_width, window.buffer_height);
             if (!window.surface) {
@@ -374,8 +433,13 @@ int main(int argc, char** argv) {
             if (auto sent = client->set_mapped(window.id, false); !sent) {
                 return fail("cannot unmap a window", sent.error());
             }
-            continue;
         }
+        if (window.opacity != Opacity::Opaque) {
+            if (auto sent = client->set_opaque_rect(window.id, window.opaque_rect()); !sent) {
+                return fail("cannot set the opaque rectangle", sent.error());
+            }
+        }
+        if (!entry.mapped) continue;
         if (auto sent = client->attach_buffer(window.id, *window.surface); !sent) {
             return fail("cannot attach a buffer", sent.error());
         }

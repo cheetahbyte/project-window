@@ -7,8 +7,8 @@
 
 namespace pw {
 
-// Walks opaque windows from the top down. Each window asks what of it shows past the windows
-// covered so far, then covers its own frame if it is drawn. All rectangles share one unit.
+// Walks windows from the top down. Each window asks what of it shows past the opaque parts
+// covered so far, then covers its own opaque part if it is drawn. All rectangles share one unit.
 class Occlusion {
 public:
     explicit Occlusion(const Rect& display) : display_{display} {}

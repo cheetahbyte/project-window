@@ -131,6 +131,10 @@ Result<void> Client::move_window(std::uint32_t window, std::int32_t x, std::int3
     return send(connection_, MoveWindow{.window = window, .x = x, .y = y});
 }
 
+Result<void> Client::set_opaque_rect(std::uint32_t window, Rect rect) {
+    return send(connection_, SetOpaqueRect{.window = window, .rect = rect});
+}
+
 Result<void> Client::sync(std::chrono::milliseconds timeout) {
     const std::uint32_t serial{next_serial_++};
     if (const Result<void> sent = send(connection_, Sync{.serial = serial}); !sent) return sent;

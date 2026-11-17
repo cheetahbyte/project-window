@@ -40,8 +40,9 @@ void post_event(const SendRight& events, const Payload& payload) {
 
 }  // namespace
 
-Server::Server(id<MTLDevice> device, ReleasePolicy policy, std::function<void()> on_damage)
-    : device_{device}, policy_{policy}, on_damage_{std::move(on_damage)} {}
+Server::Server(id<MTLDevice> device, ReleasePolicy policy, EffectSet effects,
+               std::function<void()> on_damage)
+    : device_{device}, policy_{policy}, effects_{effects}, on_damage_{std::move(on_damage)} {}
 
 Server::~Server() {
     if (!receiver_.joinable()) return;
@@ -84,6 +85,12 @@ id<MTLTexture> Server::texture(WindowKey key) const {
 id<MTLTexture> Server::drawn_texture(const Window& window) const {
     if (!window.mapped || !window.visible) return nil;
     return texture(window.key);
+}
+
+Rect Server::opaque_pixels(const Window& window) const {
+    if (!display_) return {};
+    if (!effects_.contains(Effect::Alpha)) return display_->frame_pixels(window.frame);
+    return display_->opaque_pixels(window.frame, window.scale, window.opaque);
 }
 
 Region Server::take_damage() {
@@ -284,6 +291,26 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
         return true;
     }
 
+    if (std::optional<Received<SetOpaqueRect>> set = message.take<SetOpaqueRect>()) {
+        Window* window = scene_.find({connection, set->payload.window});
+        if (!window) return false;
+        const Rect& rect = set->payload.rect;
+        Rect opaque{};
+        if (rect.width != 0 && rect.height != 0) {
+            if (rect.x < 0 || rect.y < 0 || rect.width < 0 || rect.height < 0 ||
+                std::int64_t{rect.x} + rect.width > window->frame.width ||
+                std::int64_t{rect.y} + rect.height > window->frame.height) {
+                return false;
+            }
+            opaque = rect;
+        }
+        if (!effects_.contains(Effect::Alpha)) return true;
+        window->opaque = opaque;
+        damage_if_drawn(*window);
+        visibility_dirty_ = true;
+        return true;
+    }
+
     if (std::optional<Received<Sync>> sync = message.take<Sync>()) {
         post_event(connections_.at(connection).events, Synced{.serial = sync->payload.serial});
         return true;
@@ -345,7 +372,7 @@ void Server::update_visibility() {
 std::vector<Server::VisibilityChange> Server::recompute_visibility() {
     std::vector<VisibilityChange> changes;
     if (policy_ == ReleasePolicy::Never || !display_) return changes;
-    Occlusion occlusion{display_->point_bounds()};
+    Occlusion occlusion{display_->pixel_bounds()};
     for (Window& window : scene_.back_to_front() | std::views::reverse) {
         const bool visible{shows(window, occlusion)};
         if (visible != window.visible) {
@@ -359,7 +386,7 @@ std::vector<Server::VisibilityChange> Server::recompute_visibility() {
                 // A drag goes on, so a window dragged off the display can be dragged back.
             }
         }
-        if (drawn_texture(window)) occlusion.cover(window.frame);
+        if (drawn_texture(window)) occlusion.cover(opaque_pixels(window));
     }
     return changes;
 }
@@ -371,7 +398,7 @@ bool Server::shows(const Window& window, const Occlusion& occlusion) const {
     case ReleasePolicy::Unmapped:
         return window.mapped;
     case ReleasePolicy::Occluded:
-        return window.mapped && !occlusion.uncovered(window.frame).empty();
+        return window.mapped && !occlusion.uncovered(display_->frame_pixels(window.frame)).empty();
     }
     return true;
 }

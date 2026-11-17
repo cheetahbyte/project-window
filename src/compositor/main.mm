@@ -5,6 +5,8 @@
 #import "compositor/renderer.h"
 #import "compositor/server.h"
 
+#include "compositor/effects.h"
+
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
@@ -59,10 +61,33 @@ std::optional<pw::RedrawMode> parse_redraw(std::string_view text) {
     return std::nullopt;
 }
 
+std::optional<pw::Effect> parse_effect(std::string_view text) {
+    if (text == "alpha") return pw::Effect::Alpha;
+    if (text == "corners") return pw::Effect::Corners;
+    if (text == "shadows") return pw::Effect::Shadows;
+    if (text == "blur") return pw::Effect::Blur;
+    if (text == "animation") return pw::Effect::Animation;
+    return std::nullopt;
+}
+
+// A comma-separated list of distinct effect names, or "none".
+std::optional<pw::EffectSet> parse_effects(std::string_view text) {
+    pw::EffectSet effects{};
+    if (text == "none") return effects;
+    while (true) {
+        const std::size_t separator = text.find(',');
+        const std::optional<pw::Effect> effect = parse_effect(text.substr(0, separator));
+        if (!effect || !effects.insert(*effect)) return std::nullopt;
+        if (separator == std::string_view::npos) return effects;
+        text.remove_prefix(separator + 1);
+    }
+}
+
 struct Options {
     std::optional<pw::DisplaySize> display;
     std::optional<pw::ReleasePolicy> release;
     std::optional<pw::RedrawMode> redraw;
+    std::optional<pw::EffectSet> effects;
     bool input{true};
     bool verify_redraw{false};
 };
@@ -91,6 +116,9 @@ std::optional<Options> parse_options(std::span<char* const> arguments) {
         } else if (argument == "--redraw" && !options.redraw) {
             options.redraw = parse_redraw(value);
             if (!options.redraw) return std::nullopt;
+        } else if (argument == "--effects" && !options.effects) {
+            options.effects = parse_effects(value);
+            if (!options.effects) return std::nullopt;
         } else {
             return std::nullopt;
         }
@@ -257,7 +285,8 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "usage: compositor [--display WIDTHxHEIGHT] [--no-input] "
                      "[--release never|unmapped|occluded] [--redraw overdraw|full|damage] "
-                     "[--verify-redraw]  (points, 1..%d)\n",
+                     "[--verify-redraw] [--effects none|LIST]  (points, 1..%d; LIST is "
+                     "comma-separated from alpha,corners,shadows,blur,animation)\n",
                      kMaxDisplayPoints);
         return kUsageExitStatus;
     }
@@ -288,6 +317,7 @@ int main(int argc, char* argv[]) {
 
         DisplayView* view = nil;
         pw::Server server{device, options->release.value_or(pw::ReleasePolicy::Occluded),
+                          options->effects.value_or(pw::EffectSet::all()),
                           [&view] { [view requestFrame]; }};
         const pw::Server* const stats_source{&server};
         if (const pw::Result<void> started = server.start(); !started) {

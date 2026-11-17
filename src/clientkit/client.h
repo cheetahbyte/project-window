@@ -25,7 +25,8 @@ struct CfRelease {
 template <class Ref>
 using CfOwner = std::unique_ptr<std::remove_pointer_t<Ref>, CfRelease>;
 
-// A BGRA8 pixel buffer that can be shared with the compositor. Pixels are 0xAARRGGBB.
+// A BGRA8 pixel buffer that can be shared with the compositor. Pixels are 0xAARRGGBB with
+// colour premultiplied by alpha.
 class Surface {
 public:
     [[nodiscard]] static std::optional<Surface> create(int width, int height);
@@ -78,6 +79,7 @@ public:
     [[nodiscard]] Result<void> destroy_window(std::uint32_t window);
     [[nodiscard]] Result<void> set_mapped(std::uint32_t window, bool mapped);
     [[nodiscard]] Result<void> move_window(std::uint32_t window, std::int32_t x, std::int32_t y);
+    [[nodiscard]] Result<void> set_opaque_rect(std::uint32_t window, Rect rect);
 
     // Waits until the server has processed everything sent so far. Events that arrive
     // meanwhile are kept for next_event.

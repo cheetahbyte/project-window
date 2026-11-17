@@ -23,7 +23,8 @@ namespace pw {
 enum class RedrawMode {
     // Every frame repaints the display, drawing every window in full from the back.
     Overdraw,
-    // Every frame repaints the display, drawing only what of each window shows.
+    // Every frame repaints the display, drawing only what of each window no opaque part above
+    // it hides.
     Full,
     // Every frame repaints only what changed since the chosen buffer was last shown.
     Damage,
@@ -51,8 +52,9 @@ public:
     // Returns nullptr after reporting on stderr when the shaders cannot be loaded.
     static std::unique_ptr<Renderer> create(id<MTLDevice> device, RedrawMode mode, bool verify);
 
-    Renderer(id<MTLDevice> device, id<MTLRenderPipelineState> textured,
-             id<MTLRenderPipelineState> solid, RedrawMode mode, bool verify);
+    Renderer(id<MTLDevice> device, id<MTLRenderPipelineState> opaque,
+             id<MTLRenderPipelineState> blended, id<MTLRenderPipelineState> solid,
+             RedrawMode mode, bool verify);
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
@@ -80,7 +82,10 @@ private:
 
     id<MTLDevice> device_;
     id<MTLCommandQueue> queue_;
-    id<MTLRenderPipelineState> textured_;
+    // Replaces the target and forces alpha to 1.
+    id<MTLRenderPipelineState> opaque_;
+    // Blends premultiplied contents over the target, keeping its alpha.
+    id<MTLRenderPipelineState> blended_;
     id<MTLRenderPipelineState> solid_;
     RedrawMode mode_;
     bool verify_;

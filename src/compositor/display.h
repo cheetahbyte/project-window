@@ -46,6 +46,30 @@ struct Display {
                 frame_points.width * pixels_per_point, frame_points.height * pixels_per_point};
     }
 
+    // Maps a window's opaque rectangle, in window points and within the frame, to display
+    // pixels. Where the display has more pixels per point than the buffer, linear filtering
+    // mixes texels across an inner edge, so such edges move inward past every mixed pixel.
+    [[nodiscard]] Rect opaque_pixels(const Rect& frame_points, std::uint32_t buffer_scale,
+                                     const Rect& opaque_points) const {
+        if (opaque_points.width <= 0 || opaque_points.height <= 0) return {};
+        const std::int64_t scale{pixels_per_point};
+        const std::int64_t buffer{std::max<std::int64_t>(buffer_scale, 1)};
+        // A display pixel samples buffer texels within scale / (2 * buffer) - 1/2 of its own.
+        const std::int64_t inset{scale > buffer ? (scale + buffer - 1) / (2 * buffer) : 0};
+        const std::int64_t opaque_right{std::int64_t{opaque_points.x} + opaque_points.width};
+        const std::int64_t opaque_bottom{std::int64_t{opaque_points.y} + opaque_points.height};
+        const std::int64_t left{(std::int64_t{frame_points.x} + opaque_points.x) * scale +
+                                (opaque_points.x > 0 ? inset : 0)};
+        const std::int64_t top{(std::int64_t{frame_points.y} + opaque_points.y) * scale +
+                               (opaque_points.y > 0 ? inset : 0)};
+        const std::int64_t right{(std::int64_t{frame_points.x} + opaque_right) * scale -
+                                 (opaque_right < frame_points.width ? inset : 0)};
+        const std::int64_t bottom{(std::int64_t{frame_points.y} + opaque_bottom) * scale -
+                                  (opaque_bottom < frame_points.height ? inset : 0)};
+        if (left >= right || top >= bottom) return {};
+        return {narrow(left), narrow(top), narrow(right - left), narrow(bottom - top)};
+    }
+
     // Maps a damage rectangle in buffer pixels of a window drawn at buffer_scale pixels per
     // point to display pixels, rounding outward when the scales differ. The damage must lie
     // within the buffer, whose sides are at most kMaxDimension.

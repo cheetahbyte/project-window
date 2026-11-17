@@ -23,6 +23,7 @@ enum class MessageId : mach_msg_id_t {
     SetMapped,
     MoveWindow,
     Sync,
+    SetOpaqueRect,
 
     Welcome = 2000,
     Configure,
@@ -88,6 +89,16 @@ struct MoveWindow {
     static constexpr bool carries_port = false;
     std::uint32_t window;
     std::int32_t x, y;
+};
+
+// The part of the window, in window points, whose pixels are guaranteed opaque. Only that
+// part hides what is beneath it. A new window is opaque everywhere; a rectangle with no
+// area means no part is.
+struct SetOpaqueRect {
+    static constexpr MessageId id = MessageId::SetOpaqueRect;
+    static constexpr bool carries_port = false;
+    std::uint32_t window;
+    Rect rect;
 };
 
 // Answered with Synced carrying the same serial once everything sent before it is processed.

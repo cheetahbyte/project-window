@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -65,7 +66,8 @@ constexpr double kMicrosecondsPerMillisecond{1000.0};
 
 constexpr std::string_view kUsage{
     "usage: bench --scene PATH [--clients N] [--settle SECONDS] [--measure SECONDS] [--output FILE]\n"
-    "             [--release never|unmapped|occluded] [--redraw overdraw|full|damage] [--verify-redraw]\n"};
+    "             [--release never|unmapped|occluded] [--redraw overdraw|full|damage] [--verify-redraw]\n"
+    "             [--effects none|alpha,corners,shadows,blur,animation]\n"};
 
 volatile std::sig_atomic_t g_stop_signal{0};
 
@@ -664,6 +666,31 @@ std::string_view redraw_mode_name(RedrawMode mode) {
     throw std::logic_error{"unknown redraw mode"};
 }
 
+constexpr std::array kEffectNames{
+    std::string_view{"alpha"}, std::string_view{"corners"}, std::string_view{"shadows"},
+    std::string_view{"blur"},  std::string_view{"animation"},
+};
+
+bool valid_effects(std::string_view text) {
+    if (text == "none") {
+        return true;
+    }
+    std::vector<std::string_view> seen;
+    for (;;) {
+        const std::size_t comma{text.find(',')};
+        const std::string_view name{text.substr(0, comma)};
+        if (std::ranges::find(kEffectNames, name) == kEffectNames.end() ||
+            std::ranges::find(seen, name) != seen.end()) {
+            return false;
+        }
+        seen.push_back(name);
+        if (comma == std::string_view::npos) {
+            return true;
+        }
+        text.remove_prefix(comma + 1);
+    }
+}
+
 struct Options {
     std::filesystem::path scene;
     std::size_t clients{kDefaultClients};
@@ -672,6 +699,7 @@ struct Options {
     std::optional<std::filesystem::path> output;
     std::optional<ReleasePolicy> release;
     std::optional<RedrawMode> redraw;
+    std::optional<std::string> effects;
     bool verify_redraw{false};
 };
 
@@ -723,6 +751,12 @@ Options parse_options(std::span<char*> argv) {
                 throw UsageError{"--redraw must be overdraw, full or damage"};
             }
             options.redraw = *redraw;
+        } else if (flag == "--effects") {
+            if (!valid_effects(value)) {
+                throw UsageError{"--effects must be none or a comma-separated list of distinct names from "
+                                 "alpha, corners, shadows, blur, animation"};
+            }
+            options.effects = std::string{value};
         } else {
             throw UsageError{std::format("unknown argument {}", flag)};
         }
@@ -835,6 +869,10 @@ public:
         if (options_.redraw) {
             arguments.emplace_back("--redraw");
             arguments.emplace_back(redraw_mode_name(*options_.redraw));
+        }
+        if (options_.effects) {
+            arguments.emplace_back("--effects");
+            arguments.emplace_back(*options_.effects);
         }
         if (options_.verify_redraw) {
             arguments.emplace_back("--verify-redraw");
@@ -1192,6 +1230,7 @@ std::string render(const Facts& facts, const Scene& scene, const Options& option
     out += std::format("- Client processes: {}\n", options.clients);
     out += std::format("- Buffer release: {}\n", options.release ? release_policy_name(*options.release) : "default");
     out += std::format("- Redraw: {}\n", options.redraw ? redraw_mode_name(*options.redraw) : "default");
+    out += std::format("- Effects: {}\n", options.effects ? *options.effects : "default");
     if (options.verify_redraw) {
         out += "- Redraw verification: on\n";
     }

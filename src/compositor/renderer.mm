@@ -33,10 +33,13 @@ struct QuadUniforms {
     simd_float2 target{};
 };
 
+enum class Blending { Replace, PremultipliedOver };
+
 struct DrawnWindow {
     id<MTLTexture> texture;
     Rect frame_pixels{};
-    std::vector<Rect> rects;
+    std::vector<Rect> opaque_rects;
+    std::vector<Rect> translucent_rects;
 };
 
 std::string describe(NSError* error) {
@@ -53,11 +56,22 @@ bool set_number(CFMutableDictionaryRef dictionary, CFStringRef key, std::int32_t
 }
 
 id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device, id<MTLLibrary> library,
-                                         NSString* fragment) {
+                                         NSString* fragment, Blending blending) {
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
     descriptor.vertexFunction = [library newFunctionWithName:@"quad_vertex"];
     descriptor.fragmentFunction = [library newFunctionWithName:fragment];
-    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    MTLRenderPipelineColorAttachmentDescriptor* colour = descriptor.colorAttachments[0];
+    colour.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (blending == Blending::PremultipliedOver) {
+        colour.blendingEnabled = YES;
+        colour.rgbBlendOperation = MTLBlendOperationAdd;
+        colour.sourceRGBBlendFactor = MTLBlendFactorOne;
+        colour.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        // Whatever lies beneath has alpha 1, so the result does too; keeping it avoids rounding.
+        colour.alphaBlendOperation = MTLBlendOperationAdd;
+        colour.sourceAlphaBlendFactor = MTLBlendFactorZero;
+        colour.destinationAlphaBlendFactor = MTLBlendFactorOne;
+    }
     NSError* error = nil;
     id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor
                                                                                  error:&error];
@@ -101,17 +115,23 @@ std::unique_ptr<Renderer> Renderer::create(id<MTLDevice> device, RedrawMode mode
         std::fprintf(stderr, "compositor: %s\n", describe(error).c_str());
         return nullptr;
     }
-    id<MTLRenderPipelineState> textured = make_pipeline(device, library, @"quad_fragment");
-    id<MTLRenderPipelineState> solid = make_pipeline(device, library, @"solid_fragment");
-    if (!textured || !solid) return nullptr;
-    return std::make_unique<Renderer>(device, textured, solid, mode, verify);
+    id<MTLRenderPipelineState> opaque =
+        make_pipeline(device, library, @"opaque_fragment", Blending::Replace);
+    id<MTLRenderPipelineState> blended =
+        make_pipeline(device, library, @"blended_fragment", Blending::PremultipliedOver);
+    id<MTLRenderPipelineState> solid =
+        make_pipeline(device, library, @"solid_fragment", Blending::Replace);
+    if (!opaque || !blended || !solid) return nullptr;
+    return std::make_unique<Renderer>(device, opaque, blended, solid, mode, verify);
 }
 
-Renderer::Renderer(id<MTLDevice> device, id<MTLRenderPipelineState> textured,
-                   id<MTLRenderPipelineState> solid, RedrawMode mode, bool verify)
+Renderer::Renderer(id<MTLDevice> device, id<MTLRenderPipelineState> opaque,
+                   id<MTLRenderPipelineState> blended, id<MTLRenderPipelineState> solid,
+                   RedrawMode mode, bool verify)
     : device_{device},
       queue_{[device newCommandQueue]},
-      textured_{textured},
+      opaque_{opaque},
+      blended_{blended},
       solid_{solid},
       mode_{mode},
       verify_{verify && mode == RedrawMode::Damage} {}
@@ -273,15 +293,29 @@ void Renderer::encode(id<MTLCommandBuffer> commands, id<MTLTexture> target, MTLL
         [encoder setFragmentBytes:&kBackground length:sizeof kBackground atIndex:0];
         for (const Rect& rect : rects) draw(bounds, rect);
     };
+    // Every pixel's bottom-most contribution replaces, so a partial repaint never depends on
+    // what the buffer held before.
+    const auto draw_window = [&](const DrawnWindow& window) {
+        [encoder setFragmentTexture:window.texture atIndex:0];
+        if (!window.opaque_rects.empty()) [encoder setRenderPipelineState:opaque_];
+        for (const Rect& rect : window.opaque_rects) draw(window.frame_pixels, rect);
+        if (!window.translucent_rects.empty()) [encoder setRenderPipelineState:blended_];
+        for (const Rect& rect : window.translucent_rects) draw(window.frame_pixels, rect);
+    };
 
     if (!cull) {
         draw_background({bounds});
-        [encoder setRenderPipelineState:textured_];
         for (const Window& window : server.scene().back_to_front()) {
             id<MTLTexture> texture = server.drawn_texture(window);
             if (!texture) continue;
-            [encoder setFragmentTexture:texture atIndex:0];
-            draw(display.frame_pixels(window.frame), bounds);
+            const Rect frame{display.frame_pixels(window.frame)};
+            const Rect opaque{server.opaque_pixels(window)};
+            Region translucent{frame};
+            translucent.subtract(opaque);
+            draw_window({.texture = texture,
+                         .frame_pixels = frame,
+                         .opaque_rects = Region{opaque}.rects(),
+                         .translucent_rects = translucent.rects()});
         }
         [encoder endEncoding];
         return;
@@ -293,16 +327,19 @@ void Renderer::encode(id<MTLCommandBuffer> commands, id<MTLTexture> target, MTLL
         id<MTLTexture> texture = server.drawn_texture(window);
         if (!texture) continue;
         const Rect frame{display.frame_pixels(window.frame)};
+        const Rect opaque{server.opaque_pixels(window)};
         const Region shown{occlusion.uncovered(frame).intersected(repaint)};
-        occlusion.cover(frame);
-        if (!shown.empty()) drawn.push_back({texture, frame, shown.rects()});
+        occlusion.cover(opaque);
+        if (shown.empty()) continue;
+        Region translucent{shown};
+        translucent.subtract(opaque);
+        drawn.push_back({.texture = texture,
+                         .frame_pixels = frame,
+                         .opaque_rects = shown.intersected(Region{opaque}).rects(),
+                         .translucent_rects = translucent.rects()});
     }
     draw_background(occlusion.uncovered_display().intersected(repaint).rects());
-    [encoder setRenderPipelineState:textured_];
-    for (const DrawnWindow& window : drawn) {
-        [encoder setFragmentTexture:window.texture atIndex:0];
-        for (const Rect& rect : window.rects) draw(window.frame_pixels, rect);
-    }
+    for (const DrawnWindow& window : drawn | std::views::reverse) draw_window(window);
     [encoder endEncoding];
 }
 

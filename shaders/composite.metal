@@ -23,10 +23,18 @@ vertex QuadVertex quad_vertex(uint vertex_id [[vertex_id]],
     return out;
 }
 
-fragment float4 quad_fragment(QuadVertex in [[stage_in]],
-                              texture2d<float> contents [[texture(0)]]) {
-    constexpr sampler linear_sampler(filter::linear);
+constexpr sampler linear_sampler(filter::linear);
+
+// Alpha is forced so that a window claiming opacity it lacks cannot expose stale pixels.
+fragment float4 opaque_fragment(QuadVertex in [[stage_in]],
+                                texture2d<float> contents [[texture(0)]]) {
     return float4(contents.sample(linear_sampler, in.uv).rgb, 1.0);
+}
+
+// Contents are premultiplied; the pipeline blends them over the target.
+fragment float4 blended_fragment(QuadVertex in [[stage_in]],
+                                 texture2d<float> contents [[texture(0)]]) {
+    return contents.sample(linear_sampler, in.uv);
 }
 
 fragment float4 solid_fragment(constant float4& colour [[buffer(0)]]) {
