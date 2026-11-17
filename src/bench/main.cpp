@@ -708,7 +708,7 @@ public:
 
     void start_compositor() {
         compositor_ = spawn("compositor", executables_.compositor,
-                            {"--display", std::format("{}x{}", scene_.width, scene_.height)}, frames_file_.fd().get(),
+                            {"--display", std::format("{}x{}", scene_.width, scene_.height), "--no-input"}, frames_file_.fd().get(),
                             UniqueFd{});
     }
 

@@ -48,12 +48,17 @@ std::optional<DisplaySize> parse_display(std::string_view text) {
 
 struct Options {
     std::optional<DisplaySize> display;
+    bool input{true};
 };
 
 std::optional<Options> parse_options(std::span<char* const> arguments) {
     Options options{};
     for (std::size_t index{1}; index < arguments.size(); ++index) {
         const std::string_view argument{arguments[index]};
+        if (argument == "--no-input") {
+            options.input = false;
+            continue;
+        }
         if (argument != "--display" || options.display || index + 1 >= arguments.size()) {
             return std::nullopt;
         }
@@ -109,6 +114,8 @@ id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
                        server:(pw::Server*)server
                      pipeline:(id<MTLRenderPipelineState>)pipeline;
 @property(readonly) std::uint64_t framesPresented;
+// When NO, pointer events are swallowed so a stray click cannot disturb a measurement.
+@property BOOL inputEnabled;
 @end
 
 @implementation DisplayView {
@@ -129,6 +136,7 @@ id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
     _pipeline = pipeline;
     _queue = [pipeline.device newCommandQueue];
     _framesPresented = 0;
+    _inputEnabled = YES;
     self.delegate = self;
     // Draw only when the server reports damage, never on a timer.
     self.paused = YES;
@@ -173,6 +181,7 @@ id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
 }
 
 - (void)sendPointer:(pw::PointerPhase)phase event:(NSEvent*)event {
+    if (!_inputEnabled) return;
     const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     _server->pointer(phase, static_cast<float>(point.x),
                      static_cast<float>(self.bounds.size.height - point.y));
@@ -223,7 +232,7 @@ int main(int argc, char* argv[]) {
     const std::optional<Options> options =
         parse_options(std::span<char* const>{argv, static_cast<std::size_t>(argc)});
     if (!options) {
-        std::fprintf(stderr, "usage: compositor [--display WIDTHxHEIGHT]  (points, 1..%d)\n",
+        std::fprintf(stderr, "usage: compositor [--display WIDTHxHEIGHT] [--no-input]  (points, 1..%d)\n",
                      kMaxDisplayPoints);
         return kUsageExitStatus;
     }
@@ -289,6 +298,7 @@ int main(int argc, char* argv[]) {
             window.contentView = view;
             [window center];
         }
+        view.inputEnabled = options->input;
         [window makeKeyAndOrderFront:nil];
 
         dispatch_source_t frames_source = watch_signal(SIGUSR1, ^{
