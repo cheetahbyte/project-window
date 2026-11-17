@@ -1,12 +1,16 @@
 #import "compositor/server.h"
 
+#include "compositor/region.h"
+
 #import <IOSurface/IOSurface.h>
 
 #include <dispatch/dispatch.h>
 #include <mach/notify.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <ranges>
 #include <type_traits>
 #include <utility>
 
@@ -39,10 +43,22 @@ void post_event(const SendRight& events, const Payload& payload) {
     static_cast<void>(send(events, payload, SendMode::DropIfFull));
 }
 
+std::optional<Rect> intersect(const Rect& a, const Rect& b) {
+    const std::int64_t left{std::max(std::int64_t{a.x}, std::int64_t{b.x})};
+    const std::int64_t top{std::max(std::int64_t{a.y}, std::int64_t{b.y})};
+    const std::int64_t right{std::min(std::int64_t{a.x} + a.width, std::int64_t{b.x} + b.width)};
+    const std::int64_t bottom{
+        std::min(std::int64_t{a.y} + a.height, std::int64_t{b.y} + b.height)};
+    if (left >= right || top >= bottom) return std::nullopt;
+    // Both edges lie within one of the inputs, so the result fits the int32 fields again.
+    return Rect{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top),
+                static_cast<std::int32_t>(right - left), static_cast<std::int32_t>(bottom - top)};
+}
+
 }  // namespace
 
-Server::Server(id<MTLDevice> device, std::function<void()> on_damage)
-    : device_{device}, on_damage_{std::move(on_damage)} {}
+Server::Server(id<MTLDevice> device, ReleasePolicy policy, std::function<void()> on_damage)
+    : device_{device}, policy_{policy}, on_damage_{std::move(on_damage)} {}
 
 Server::~Server() {
     if (!receiver_.joinable()) return;
@@ -124,6 +140,7 @@ void Server::drain() {
         messages.pop_front();
         handle(std::move(message));
     }
+    update_visibility();
 }
 
 void Server::handle(Message message) {
@@ -167,7 +184,9 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
             return false;
         }
         if (scene_.count(connection) >= kMaxWindowsPerConnection) return false;
-        return scene_.add({connection, payload.window}, payload.frame, payload.scale);
+        if (!scene_.add({connection, payload.window}, payload.frame, payload.scale)) return false;
+        visibility_dirty_ = true;
+        return true;
     }
 
     if (std::optional<Received<AttachBuffer>> attach = message.take<AttachBuffer>()) {
@@ -176,20 +195,37 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
         if (!window) return false;
         id<MTLTexture> texture = make_texture(attach->port, *window);
         if (!texture) return false;
+        // The client sent it before reading that the window is hidden, and frees it once it does.
+        if (!window->visible) return true;
         textures_[key] = texture;
+        visibility_dirty_ = true;
         return true;
     }
 
     if (std::optional<Received<Commit>> commit = message.take<Commit>()) {
-        id<MTLTexture> texture = this->texture({connection, commit->payload.window});
+        const WindowKey key{connection, commit->payload.window};
+        Window* window = scene_.find(key);
+        if (!window) return false;
+        id<MTLTexture> texture = this->texture(key);
+        // A hidden window's buffer is dropped, and its client may commit before it learns that.
+        if (!texture) return true;
         const Rect& damage = commit->payload.damage;
-        if (!texture || damage.x < 0 || damage.y < 0 || damage.width < 0 || damage.height < 0 ||
+        if (damage.x < 0 || damage.y < 0 || damage.width < 0 || damage.height < 0 ||
             damage.width > kMaxDimension || damage.height > kMaxDimension ||
             static_cast<std::uint64_t>(damage.x) + static_cast<std::uint64_t>(damage.width) >
                 texture.width ||
             static_cast<std::uint64_t>(damage.y) + static_cast<std::uint64_t>(damage.height) >
                 texture.height) {
             return false;
+        }
+        if (window->reveal_started) {
+            const std::chrono::microseconds elapsed{
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - *window->reveal_started)};
+            window->reveal_started.reset();
+            ++reveals_.count;
+            reveals_.total += elapsed;
+            reveals_.max = std::max(reveals_.max, elapsed);
         }
         if (damage.width > 0 && damage.height > 0) on_damage_();
         return true;
@@ -201,6 +237,7 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
         textures_.erase(key);
         if (drag_ && drag_->key == key) drag_.reset();
         if (pointer_target_ == key) pointer_target_.reset();
+        visibility_dirty_ = true;
         on_damage_();
         return true;
     }
@@ -216,6 +253,7 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
             if (drag_ && drag_->key == key) drag_.reset();
             if (pointer_target_ == key) pointer_target_.reset();
         }
+        visibility_dirty_ = true;
         on_damage_();
         return true;
     }
@@ -229,6 +267,7 @@ bool Server::dispatch(mach_port_t connection, Message& message) {
         moved.y = move->payload.y;
         if (!valid_frame(moved)) return false;
         window->frame = moved;
+        visibility_dirty_ = true;
         if (window->mapped && textures_.contains(key)) on_damage_();
         return true;
     }
@@ -248,7 +287,89 @@ void Server::close(mach_port_t connection) {
     if (drag_ && drag_->key.connection == connection) drag_.reset();
     if (pointer_target_ && pointer_target_->connection == connection) pointer_target_.reset();
     connections_.erase(connection);
+    visibility_dirty_ = true;
     on_damage_();
+}
+
+void Server::set_display_size(DisplaySize size) {
+    if (display_ == size) return;
+    display_ = size;
+    visibility_dirty_ = true;
+    update_visibility();
+}
+
+// Repeats because closing a connection that missed an event can reveal what it covered.
+// Each repeat follows a close, so this ends once every remaining client keeps up.
+void Server::update_visibility() {
+    if (!display_) return;
+    while (visibility_dirty_) {
+        visibility_dirty_ = false;
+        // Holds keys only: a close below erases windows and connections.
+        const std::vector<VisibilityChange> changes = recompute_visibility();
+        for (const VisibilityChange& change : changes) {
+            const auto connection = connections_.find(change.key.connection);
+            if (connection == connections_.end()) continue;
+            const Visibility event{.window = change.key.window,
+                                   .visible = change.visible ? 1U : 0U};
+            // Unlike other events this is state the client must see, so one that cannot
+            // take it is treated as unresponsive.
+            if (!send(connection->second.events, event, SendMode::DropIfFull)) {
+                close(change.key.connection);
+                continue;
+            }
+            if (!change.visible) continue;
+            if (Window* window = scene_.find(change.key)) {
+                window->reveal_started = std::chrono::steady_clock::now();
+            }
+        }
+    }
+}
+
+// Updates every window's visible flag and drops the buffers of windows that became hidden,
+// without touching connections. Returns the transitions the clients still need to hear about.
+std::vector<Server::VisibilityChange> Server::recompute_visibility() {
+    std::vector<VisibilityChange> changes;
+    if (policy_ == ReleasePolicy::Never) return changes;
+    std::vector<Rect> occluders;
+    for (Window& window : scene_.back_to_front() | std::views::reverse) {
+        const bool visible{shows(window, occluders)};
+        if (visible != window.visible) {
+            window.visible = visible;
+            changes.push_back({window.key, visible});
+            if (!visible) {
+                textures_.erase(window.key);
+                window.reveal_started.reset();
+                if (pointer_target_ == window.key) pointer_target_.reset();
+                // A drag goes on, so a window dragged off the display can be dragged back.
+            }
+        }
+        if (visible && window.mapped && textures_.contains(window.key)) {
+            occluders.push_back(window.frame);
+        }
+    }
+    return changes;
+}
+
+bool Server::shows(const Window& window, const std::vector<Rect>& occluders) const {
+    switch (policy_) {
+    case ReleasePolicy::Never:
+        return true;
+    case ReleasePolicy::Unmapped:
+        return window.mapped;
+    case ReleasePolicy::Occluded: {
+        if (!window.mapped || !display_) return false;
+        const std::optional<Rect> shown =
+            intersect(window.frame, Rect{0, 0, display_->width, display_->height});
+        if (!shown) return false;
+        Region region{*shown};
+        for (const Rect& occluder : occluders) {
+            region.subtract(occluder);
+            if (region.empty()) return false;
+        }
+        return true;
+    }
+    }
+    return true;
 }
 
 id<MTLTexture> Server::make_texture(const SendRight& surface_port, const Window& window) {
@@ -286,6 +407,11 @@ void Server::send_input(WindowKey key, PointerPhase phase, float x, float y) {
 }
 
 void Server::pointer(PointerPhase phase, float x, float y) {
+    handle_pointer(phase, x, y);
+    update_visibility();
+}
+
+void Server::handle_pointer(PointerPhase phase, float x, float y) {
     switch (phase) {
     case PointerPhase::Down: {
         const Window* hit = scene_.top_at(x, y);
@@ -293,6 +419,7 @@ void Server::pointer(PointerPhase phase, float x, float y) {
         const WindowKey key{hit->key};
         const Rect frame{hit->frame};
         scene_.raise(key);
+        visibility_dirty_ = true;
         on_damage_();
         if (y - static_cast<float>(frame.y) < kTitleBarHeight) {
             drag_ = Drag{key, x - static_cast<float>(frame.x), y - static_cast<float>(frame.y)};
@@ -311,6 +438,7 @@ void Server::pointer(PointerPhase phase, float x, float y) {
             moved.y = static_cast<std::int32_t>(y - drag_->offset_y);
             if (!valid_frame(moved)) return;
             window->frame = moved;
+            visibility_dirty_ = true;
             post_event(connections_.at(drag_->key.connection).events,
                        Configure{.window = drag_->key.window, .frame = moved});
             on_damage_();

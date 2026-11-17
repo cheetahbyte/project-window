@@ -2,9 +2,11 @@
 
 #include "protocol/messages.h"
 
+#include <chrono>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -22,6 +24,10 @@ struct Window {
     Rect frame{};
     std::uint32_t scale{};
     bool mapped{true};
+    // Whether the server keeps a buffer for the window and tells its client to draw.
+    bool visible{true};
+    // When the server last told the client the window is visible again, until it commits.
+    std::optional<std::chrono::steady_clock::time_point> reveal_started;
 };
 
 // The windows on the display, in stacking order. Coordinates are points, origin top left.
@@ -37,6 +43,7 @@ public:
     void raise(WindowKey key);
 
     std::span<const Window> back_to_front() const { return windows_; }
+    std::span<Window> back_to_front() { return windows_; }
 
 private:
     std::vector<Window> windows_;

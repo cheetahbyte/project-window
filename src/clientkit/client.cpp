@@ -168,6 +168,7 @@ std::optional<Event> Client::next_event(std::optional<std::chrono::milliseconds>
 std::optional<Event> Client::decode(Message& message) {
     if (const auto configure = message.take<Configure>()) return configure->payload;
     if (const auto input = message.take<Input>()) return input->payload;
+    if (const auto visibility = message.take<Visibility>()) return visibility->payload;
     if (message.id() == MACH_NOTIFY_DEAD_NAME) {
         // The notification adds one user reference to the dead name; drop it so that connection_
         // is left with exactly the one reference it owns and releases on destruction.

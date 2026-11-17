@@ -32,7 +32,7 @@ Window* Scene::find(WindowKey key) {
 
 Window* Scene::top_at(float x, float y) {
     for (Window& window : windows_ | std::views::reverse) {
-        if (!window.mapped) continue;
+        if (!window.mapped || !window.visible) continue;
         const Rect& frame = window.frame;
         const float left{static_cast<float>(frame.x)};
         const float top{static_cast<float>(frame.y)};

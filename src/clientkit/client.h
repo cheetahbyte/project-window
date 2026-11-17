@@ -63,7 +63,7 @@ private:
 };
 
 struct Disconnected {};
-using Event = std::variant<Configure, Input, Disconnected>;
+using Event = std::variant<Configure, Input, Visibility, Disconnected>;
 
 class Client {
 public:

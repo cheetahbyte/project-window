@@ -58,9 +58,12 @@ constexpr int kPollStepMs{50};
 constexpr std::size_t kReadChunk{4096};
 constexpr double kBytesPerMegabyte{1024.0 * 1024.0};
 constexpr double kPercent{100.0};
+constexpr std::size_t kRevealsLineTokens{4};
+constexpr double kMicrosecondsPerMillisecond{1000.0};
 
 constexpr std::string_view kUsage{
-    "usage: bench --scene PATH [--clients N] [--settle SECONDS] [--measure SECONDS] [--output FILE]\n"};
+    "usage: bench --scene PATH [--clients N] [--settle SECONDS] [--measure SECONDS] [--output FILE]\n"
+    "             [--release never|unmapped|occluded]\n"};
 
 volatile std::sig_atomic_t g_stop_signal{0};
 
@@ -80,6 +83,25 @@ struct MachTicks {
 
 struct FrameCount {
     std::uint64_t value{};
+};
+
+struct RevealCount {
+    std::uint64_t value{};
+};
+
+struct Microseconds {
+    std::uint64_t value{};
+};
+
+struct RevealTotals {
+    RevealCount count;
+    Microseconds total;
+    Microseconds max;
+};
+
+struct Telemetry {
+    FrameCount frames;
+    RevealTotals reveals;
 };
 
 class UsageError : public std::runtime_error {
@@ -571,12 +593,44 @@ Scene load_scene(const std::filesystem::path& path) {
     return scene;
 }
 
+enum class ReleasePolicy { never, unmapped, occluded };
+
+struct ReleasePolicyName {
+    ReleasePolicy policy;
+    std::string_view name;
+};
+
+constexpr std::array kReleasePolicies{
+    ReleasePolicyName{ReleasePolicy::never, "never"},
+    ReleasePolicyName{ReleasePolicy::unmapped, "unmapped"},
+    ReleasePolicyName{ReleasePolicy::occluded, "occluded"},
+};
+
+std::optional<ReleasePolicy> parse_release_policy(std::string_view text) {
+    for (const ReleasePolicyName& entry : kReleasePolicies) {
+        if (entry.name == text) {
+            return entry.policy;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string_view release_policy_name(ReleasePolicy policy) {
+    for (const ReleasePolicyName& entry : kReleasePolicies) {
+        if (entry.policy == policy) {
+            return entry.name;
+        }
+    }
+    throw std::logic_error{"unknown release policy"};
+}
+
 struct Options {
     std::filesystem::path scene;
     std::size_t clients{kDefaultClients};
     Seconds settle{kDefaultSettle};
     Seconds measure{kDefaultMeasure};
     std::optional<std::filesystem::path> output;
+    std::optional<ReleasePolicy> release;
 };
 
 Options parse_options(std::span<char*> argv) {
@@ -611,6 +665,12 @@ Options parse_options(std::span<char*> argv) {
             options.measure = Seconds{*measure};
         } else if (flag == "--output") {
             options.output = value;
+        } else if (flag == "--release") {
+            const auto release{parse_release_policy(value)};
+            if (!release) {
+                throw UsageError{"--release must be never, unmapped or occluded"};
+            }
+            options.release = *release;
         } else {
             throw UsageError{std::format("unknown argument {}", flag)};
         }
@@ -669,7 +729,7 @@ std::string local_time_now() {
     return text.str();
 }
 
-enum class Motion { idle, animate, move };
+enum class Motion { idle, animate, move, reveal };
 
 struct StateSpec {
     Motion motion;
@@ -681,6 +741,7 @@ constexpr std::array kStates{
     StateSpec{Motion::idle, "idle", std::nullopt},
     StateSpec{Motion::animate, "animate", "--animate-top"},
     StateSpec{Motion::move, "move", "--orbit-top"},
+    StateSpec{Motion::reveal, "reveal", "--blink-top"},
 };
 
 struct StateResult {
@@ -690,6 +751,9 @@ struct StateResult {
     double compositor_cpu_percent{};
     double client_cpu_percent{};
     double frames_per_second{};
+    double reveals_per_second{};
+    std::optional<double> reveal_mean_ms;
+    std::optional<double> reveal_max_ms;
 };
 
 struct Executables {
@@ -699,7 +763,8 @@ struct Executables {
 
 class StateRun {
 public:
-    StateRun(const Executables& executables, const Scene& scene) : executables_{executables}, scene_{scene} {}
+    StateRun(const Executables& executables, const Scene& scene, std::optional<ReleasePolicy> release)
+        : executables_{executables}, scene_{scene}, release_{release} {}
     StateRun(const StateRun&) = delete;
     StateRun& operator=(const StateRun&) = delete;
     StateRun(StateRun&&) = delete;
@@ -707,9 +772,12 @@ public:
     ~StateRun() { shutdown(); }
 
     void start_compositor() {
-        compositor_ = spawn("compositor", executables_.compositor,
-                            {"--display", std::format("{}x{}", scene_.width, scene_.height), "--no-input"}, frames_file_.fd().get(),
-                            UniqueFd{});
+        std::vector<std::string> arguments{"--display", std::format("{}x{}", scene_.width, scene_.height), "--no-input"};
+        if (release_) {
+            arguments.emplace_back("--release");
+            arguments.emplace_back(release_policy_name(*release_));
+        }
+        compositor_ = spawn("compositor", executables_.compositor, arguments, frames_file_.fd().get(), UniqueFd{});
     }
 
     void start_client(std::size_t index, std::size_t count, std::optional<std::string_view> flag) {
@@ -760,18 +828,19 @@ public:
         return result;
     }
 
-    [[nodiscard]] std::pair<FrameCount, FrameCount> read_frames() {
+    [[nodiscard]] std::pair<Telemetry, Telemetry> read_frames() {
         const auto deadline{Clock::now() + kFramesTimeout};
         while (true) {
-            const auto frames{parse_frames(frames_file_.read_all())};
+            const auto frames{parse_telemetry(frames_file_.read_all())};
             if (frames.size() >= 2) {
                 return {frames.at(0), frames.at(1)};
             }
             check_stop();
             check_alive();
             if (Clock::now() >= deadline) {
-                throw std::runtime_error{
-                    std::format("compositor printed {} 'frames' line(s) after two SIGUSR1, expected 2", frames.size())};
+                throw std::runtime_error{std::format(
+                    "compositor printed {} complete 'frames' and 'reveals' line pair(s) after two SIGUSR1, expected 2",
+                    frames.size())};
             }
             std::this_thread::sleep_for(kPollStep);
         }
@@ -798,8 +867,8 @@ public:
     }
 
 private:
-    static std::vector<FrameCount> parse_frames(std::string_view content) {
-        std::vector<FrameCount> frames;
+    static std::vector<Telemetry> parse_telemetry(std::string_view content) {
+        std::vector<Telemetry> frames;
         std::size_t start{0};
         while (true) {
             const std::size_t end{content.find('\n', start)};
@@ -815,7 +884,24 @@ private:
             if (!count) {
                 throw std::runtime_error{"compositor printed a malformed 'frames' line"};
             }
-            frames.push_back(FrameCount{*count});
+            const std::size_t reveals_end{content.find('\n', start)};
+            if (reveals_end == std::string_view::npos) {
+                return frames;
+            }
+            const auto reveal_tokens{split_whitespace(content.substr(start, reveals_end - start))};
+            start = reveals_end + 1;
+            if (reveal_tokens.empty() || reveal_tokens.front() != "reveals") {
+                throw std::runtime_error{"compositor printed no 'reveals' line after a 'frames' line"};
+            }
+            const auto reveal_count{reveal_tokens.size() == kRevealsLineTokens ? parse_number<std::uint64_t>(reveal_tokens.at(1)) : std::nullopt};
+            const auto reveal_total{reveal_tokens.size() == kRevealsLineTokens ? parse_number<std::uint64_t>(reveal_tokens.at(2)) : std::nullopt};
+            const auto reveal_max{reveal_tokens.size() == kRevealsLineTokens ? parse_number<std::uint64_t>(reveal_tokens.at(3)) : std::nullopt};
+            if (!reveal_count || !reveal_total || !reveal_max) {
+                throw std::runtime_error{"compositor printed a malformed 'reveals' line"};
+            }
+            frames.push_back(Telemetry{FrameCount{*count},
+                                       RevealTotals{RevealCount{*reveal_count}, Microseconds{*reveal_total},
+                                                    Microseconds{*reveal_max}}});
         }
     }
 
@@ -909,6 +995,7 @@ private:
 
     const Executables& executables_;
     const Scene& scene_;
+    std::optional<ReleasePolicy> release_;
     TempFile frames_file_{"bench-frames"};
     std::unique_ptr<Child> compositor_;
     std::vector<std::unique_ptr<Child>> clients_;
@@ -921,7 +1008,7 @@ double cpu_percent(CpuTime cpu, Seconds interval) {
 StateResult run_state(const StateSpec& state, const Options& options, const Executables& executables,
                       const Scene& scene, const Timebase& timebase) {
     std::cerr << std::format("bench: state {}: starting compositor and {} client(s)\n", state.name, options.clients);
-    StateRun run{executables, scene};
+    StateRun run{executables, scene, options.release};
     run.start_compositor();
     for (std::size_t index{0}; index < options.clients; ++index) {
         check_stop();
@@ -939,12 +1026,17 @@ StateResult run_state(const StateSpec& state, const Options& options, const Exec
     const auto second{run.snapshot(timebase)};
     const auto second_signal{Clock::now()};
     run.request_frames();
-    const auto [frames_before, frames_after]{run.read_frames()};
+    const auto [before, after]{run.read_frames()};
     run.shutdown();
 
-    if (frames_after.value < frames_before.value) {
+    if (after.frames.value < before.frames.value) {
         throw std::runtime_error{"compositor frame count decreased between the two 'frames' lines"};
     }
+    if (after.reveals.count.value < before.reveals.count.value || after.reveals.total.value < before.reveals.total.value) {
+        throw std::runtime_error{"compositor reveal count or total time decreased between the two 'reveals' lines"};
+    }
+    const std::uint64_t reveal_count{after.reveals.count.value - before.reveals.count.value};
+    const std::uint64_t reveal_total{after.reveals.total.value - before.reveals.total.value};
     const Seconds sample_interval{second_sample - first_sample};
     const Seconds frame_interval{second_signal - first_signal};
     return StateResult{
@@ -953,8 +1045,19 @@ StateResult run_state(const StateSpec& state, const Options& options, const Exec
         .client_footprint = second.clients.footprint,
         .compositor_cpu_percent = cpu_percent(second.compositor.cpu - first.compositor.cpu, sample_interval),
         .client_cpu_percent = cpu_percent(second.clients.cpu - first.clients.cpu, sample_interval),
-        .frames_per_second = static_cast<double>(frames_after.value - frames_before.value) / frame_interval.count(),
+        .frames_per_second = static_cast<double>(after.frames.value - before.frames.value) / frame_interval.count(),
+        .reveals_per_second = static_cast<double>(reveal_count) / frame_interval.count(),
+        .reveal_mean_ms = reveal_count == 0 ? std::nullopt
+                                            : std::optional{static_cast<double>(reveal_total) /
+                                                            static_cast<double>(reveal_count) / kMicrosecondsPerMillisecond},
+        .reveal_max_ms = after.reveals.count.value == 0
+                             ? std::nullopt
+                             : std::optional{static_cast<double>(after.reveals.max.value) / kMicrosecondsPerMillisecond},
     };
+}
+
+std::string milliseconds_cell(std::optional<double> value) {
+    return value ? std::format("{:.2f}", *value) : std::string{"-"};
 }
 
 double megabytes(Bytes bytes) { return static_cast<double>(bytes.value) / kBytesPerMegabyte; }
@@ -977,16 +1080,20 @@ std::string render(const Facts& facts, const Scene& scene, const Options& option
     out += std::format("- Display: {}x{} points, scale {}\n", scene.width, scene.height, scene.scale);
     out += std::format("- Windows: {} ({} mapped)\n", scene.windows, scene.mapped);
     out += std::format("- Client processes: {}\n", options.clients);
+    out += std::format("- Buffer release: {}\n", options.release ? release_policy_name(*options.release) : "default");
     out += std::format("- Settle: {:g} s, measure: {:g} s\n\n", options.settle.count(), options.measure.count());
     out += "| State | Compositor footprint (MB) | Client footprint (MB) | Total footprint (MB) "
-           "| Compositor CPU (%) | Client CPU (%) | Total CPU (%) | Frames/s |\n";
-    out += "|---|---:|---:|---:|---:|---:|---:|---:|\n";
+           "| Compositor CPU (%) | Client CPU (%) | Total CPU (%) | Frames/s "
+           "| Reveals/s | Reveal mean (ms) | Reveal max since start (ms) |\n";
+    out += "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
     for (const StateResult& result : results) {
-        out += std::format("| {} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} |\n", result.name,
+        out += std::format("| {} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {} | {} |\n", result.name,
                            megabytes(result.compositor_footprint), megabytes(result.client_footprint),
                            megabytes(Bytes{result.compositor_footprint.value + result.client_footprint.value}),
                            result.compositor_cpu_percent, result.client_cpu_percent,
-                           result.compositor_cpu_percent + result.client_cpu_percent, result.frames_per_second);
+                           result.compositor_cpu_percent + result.client_cpu_percent, result.frames_per_second,
+                           result.reveals_per_second, milliseconds_cell(result.reveal_mean_ms),
+                           milliseconds_cell(result.reveal_max_ms));
     }
     return out;
 }

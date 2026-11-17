@@ -28,6 +28,7 @@ enum class MessageId : mach_msg_id_t {
     Configure,
     Input,
     Synced,
+    Visibility,
 };
 
 enum class PointerPhase : std::uint32_t { Down, Move, Up };
@@ -123,6 +124,16 @@ struct Synced {
     static constexpr MessageId id = MessageId::Synced;
     static constexpr bool carries_port = false;
     std::uint32_t serial;
+};
+
+// Tells the client whether anything of the window can be seen. When visible is 0 the server
+// has dropped the window's buffer and the client should free it; when it turns 1 again the
+// client attaches and commits a fresh one.
+struct Visibility {
+    static constexpr MessageId id = MessageId::Visibility;
+    static constexpr bool carries_port = false;
+    std::uint32_t window;
+    std::uint32_t visible;
 };
 
 template <class Payload>

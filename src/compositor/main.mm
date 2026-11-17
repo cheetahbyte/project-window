@@ -6,8 +6,10 @@
 
 #include <dispatch/dispatch.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cinttypes>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -22,11 +24,6 @@ namespace {
 constexpr int kUsageExitStatus = 2;
 constexpr std::int32_t kMaxDisplayPoints = 16384;
 
-struct DisplaySize {
-    std::int32_t width{};
-    std::int32_t height{};
-};
-
 std::optional<std::int32_t> parse_points(std::string_view text) {
     std::int32_t value{};
     const char* const end = text.data() + text.size();
@@ -37,17 +34,25 @@ std::optional<std::int32_t> parse_points(std::string_view text) {
     return value;
 }
 
-std::optional<DisplaySize> parse_display(std::string_view text) {
+std::optional<pw::DisplaySize> parse_display(std::string_view text) {
     const std::size_t separator = text.find('x');
     if (separator == std::string_view::npos) return std::nullopt;
     const std::optional<std::int32_t> width = parse_points(text.substr(0, separator));
     const std::optional<std::int32_t> height = parse_points(text.substr(separator + 1));
     if (!width || !height) return std::nullopt;
-    return DisplaySize{.width = *width, .height = *height};
+    return pw::DisplaySize{.width = *width, .height = *height};
+}
+
+std::optional<pw::ReleasePolicy> parse_release(std::string_view text) {
+    if (text == "never") return pw::ReleasePolicy::Never;
+    if (text == "unmapped") return pw::ReleasePolicy::Unmapped;
+    if (text == "occluded") return pw::ReleasePolicy::Occluded;
+    return std::nullopt;
 }
 
 struct Options {
-    std::optional<DisplaySize> display;
+    std::optional<pw::DisplaySize> display;
+    std::optional<pw::ReleasePolicy> release;
     bool input{true};
 };
 
@@ -59,14 +64,31 @@ std::optional<Options> parse_options(std::span<char* const> arguments) {
             options.input = false;
             continue;
         }
-        if (argument != "--display" || options.display || index + 1 >= arguments.size()) {
+        if (index + 1 >= arguments.size()) return std::nullopt;
+        ++index;
+        const std::string_view value{arguments[index]};
+        if (argument == "--display" && !options.display) {
+            options.display = parse_display(value);
+            if (!options.display) return std::nullopt;
+        } else if (argument == "--release" && !options.release) {
+            options.release = parse_release(value);
+            if (!options.release) return std::nullopt;
+        } else {
             return std::nullopt;
         }
-        ++index;
-        options.display = parse_display(arguments[index]);
-        if (!options.display) return std::nullopt;
     }
     return options;
+}
+
+std::int32_t whole_points(CGFloat length) {
+    // Rounds up so a partly shown last row or column still counts as on the display.
+    if (!(length > 0)) return 0;
+    return static_cast<std::int32_t>(
+        std::ceil(std::min(length, static_cast<CGFloat>(kMaxDisplayPoints))));
+}
+
+pw::DisplaySize display_size_of(NSSize size) {
+    return {.width = whole_points(size.width), .height = whole_points(size.height)};
 }
 
 // Keeps the dispatch source alive and running for as long as the returned object lives.
@@ -137,6 +159,7 @@ id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
     _queue = [pipeline.device newCommandQueue];
     _framesPresented = 0;
     _inputEnabled = YES;
+    _server->set_display_size(display_size_of(self.bounds.size));
     self.delegate = self;
     // Draw only when the server reports damage, never on a timer.
     self.paused = YES;
@@ -144,6 +167,12 @@ id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
     self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     self.clearColor = MTLClearColorMake(0.10, 0.11, 0.13, 1.0);
     return self;
+}
+
+- (void)setFrameSize:(NSSize)size {
+    [super setFrameSize:size];
+    // Also called from the superclass initialiser, before the server is set.
+    if (_server) _server->set_display_size(display_size_of(self.bounds.size));
 }
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {
@@ -160,7 +189,7 @@ id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
 
     const CGSize display = view.bounds.size;
     for (const pw::Window& window : _server->scene().back_to_front()) {
-        if (!window.mapped) continue;
+        if (!window.mapped || !window.visible) continue;
         id<MTLTexture> texture = _server->texture(window.key);
         if (!texture) continue;
         const QuadUniforms uniforms{
@@ -232,7 +261,9 @@ int main(int argc, char* argv[]) {
     const std::optional<Options> options =
         parse_options(std::span<char* const>{argv, static_cast<std::size_t>(argc)});
     if (!options) {
-        std::fprintf(stderr, "usage: compositor [--display WIDTHxHEIGHT] [--no-input]  (points, 1..%d)\n",
+        std::fprintf(stderr,
+                     "usage: compositor [--display WIDTHxHEIGHT] [--no-input] "
+                     "[--release never|unmapped|occluded]  (points, 1..%d)\n",
                      kMaxDisplayPoints);
         return kUsageExitStatus;
     }
@@ -256,7 +287,9 @@ int main(int argc, char* argv[]) {
         if (!pipeline) return 1;
 
         DisplayView* view = nil;
-        pw::Server server{device, [&view] { view.needsDisplay = YES; }};
+        pw::Server server{device, options->release.value_or(pw::ReleasePolicy::Occluded),
+                          [&view] { view.needsDisplay = YES; }};
+        const pw::Server* const stats_source{&server};
         if (const pw::Result<void> started = server.start(); !started) {
             const std::string service{pw::kServiceName};
             std::fprintf(stderr, "compositor: cannot register %s: %s\n", service.c_str(),
@@ -302,7 +335,11 @@ int main(int argc, char* argv[]) {
         [window makeKeyAndOrderFront:nil];
 
         dispatch_source_t frames_source = watch_signal(SIGUSR1, ^{
-            std::fprintf(stdout, "frames %" PRIu64 "\n", view.framesPresented);
+            const pw::RevealStats& reveals = stats_source->reveal_stats();
+            std::fprintf(stdout, "frames %" PRIu64 "\nreveals %" PRIu64 " %" PRId64 " %" PRId64 "\n",
+                         view.framesPresented, reveals.count,
+                         static_cast<std::int64_t>(reveals.total.count()),
+                         static_cast<std::int64_t>(reveals.max.count()));
             std::fflush(stdout);
         });
         dispatch_source_t terminate_source = watch_signal(SIGTERM, ^{

@@ -42,7 +42,8 @@ add_custom_target(shaders DEPENDS ${SHADER_LIB})
 add_executable(compositor
   src/compositor/main.mm
   src/compositor/server.mm
-  src/compositor/scene.cpp)
+  src/compositor/scene.cpp
+  src/compositor/region.cpp)
 add_dependencies(compositor shaders)
 target_link_libraries(compositor PRIVATE protocol
   "-framework AppKit" "-framework Metal" "-framework MetalKit"
