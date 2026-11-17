@@ -59,11 +59,13 @@ constexpr std::size_t kReadChunk{4096};
 constexpr double kBytesPerMegabyte{1024.0 * 1024.0};
 constexpr double kPercent{100.0};
 constexpr std::size_t kRevealsLineTokens{4};
+constexpr std::size_t kGpuLineTokens{2};
+constexpr std::size_t kVerifyLineTokens{3};
 constexpr double kMicrosecondsPerMillisecond{1000.0};
 
 constexpr std::string_view kUsage{
     "usage: bench --scene PATH [--clients N] [--settle SECONDS] [--measure SECONDS] [--output FILE]\n"
-    "             [--release never|unmapped|occluded]\n"};
+    "             [--release never|unmapped|occluded] [--redraw overdraw|full|damage] [--verify-redraw]\n"};
 
 volatile std::sig_atomic_t g_stop_signal{0};
 
@@ -99,9 +101,16 @@ struct RevealTotals {
     Microseconds max;
 };
 
+struct VerifyTotals {
+    FrameCount checked;
+    FrameCount mismatched;
+};
+
 struct Telemetry {
     FrameCount frames;
     RevealTotals reveals;
+    Microseconds gpu;
+    VerifyTotals verify;
 };
 
 class UsageError : public std::runtime_error {
@@ -624,6 +633,37 @@ std::string_view release_policy_name(ReleasePolicy policy) {
     throw std::logic_error{"unknown release policy"};
 }
 
+enum class RedrawMode { overdraw, full, damage };
+
+struct RedrawModeName {
+    RedrawMode mode;
+    std::string_view name;
+};
+
+constexpr std::array kRedrawModes{
+    RedrawModeName{RedrawMode::overdraw, "overdraw"},
+    RedrawModeName{RedrawMode::full, "full"},
+    RedrawModeName{RedrawMode::damage, "damage"},
+};
+
+std::optional<RedrawMode> parse_redraw_mode(std::string_view text) {
+    for (const RedrawModeName& entry : kRedrawModes) {
+        if (entry.name == text) {
+            return entry.mode;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string_view redraw_mode_name(RedrawMode mode) {
+    for (const RedrawModeName& entry : kRedrawModes) {
+        if (entry.mode == mode) {
+            return entry.name;
+        }
+    }
+    throw std::logic_error{"unknown redraw mode"};
+}
+
 struct Options {
     std::filesystem::path scene;
     std::size_t clients{kDefaultClients};
@@ -631,6 +671,8 @@ struct Options {
     Seconds measure{kDefaultMeasure};
     std::optional<std::filesystem::path> output;
     std::optional<ReleasePolicy> release;
+    std::optional<RedrawMode> redraw;
+    bool verify_redraw{false};
 };
 
 Options parse_options(std::span<char*> argv) {
@@ -638,6 +680,10 @@ Options parse_options(std::span<char*> argv) {
     bool have_scene{false};
     for (std::size_t i{1}; i < argv.size(); ++i) {
         const std::string_view flag{argv[i]};
+        if (flag == "--verify-redraw") {
+            options.verify_redraw = true;
+            continue;
+        }
         if (i + 1 >= argv.size()) {
             throw UsageError{std::format("missing value for {}", flag)};
         }
@@ -671,6 +717,12 @@ Options parse_options(std::span<char*> argv) {
                 throw UsageError{"--release must be never, unmapped or occluded"};
             }
             options.release = *release;
+        } else if (flag == "--redraw") {
+            const auto redraw{parse_redraw_mode(value)};
+            if (!redraw) {
+                throw UsageError{"--redraw must be overdraw, full or damage"};
+            }
+            options.redraw = *redraw;
         } else {
             throw UsageError{std::format("unknown argument {}", flag)};
         }
@@ -751,6 +803,9 @@ struct StateResult {
     double compositor_cpu_percent{};
     double client_cpu_percent{};
     double frames_per_second{};
+    std::optional<double> gpu_ms_per_frame;
+    FrameCount frames_checked;
+    FrameCount frames_mismatched;
     double reveals_per_second{};
     std::optional<double> reveal_mean_ms;
     std::optional<double> reveal_max_ms;
@@ -763,8 +818,8 @@ struct Executables {
 
 class StateRun {
 public:
-    StateRun(const Executables& executables, const Scene& scene, std::optional<ReleasePolicy> release)
-        : executables_{executables}, scene_{scene}, release_{release} {}
+    StateRun(const Executables& executables, const Scene& scene, const Options& options)
+        : executables_{executables}, scene_{scene}, options_{options} {}
     StateRun(const StateRun&) = delete;
     StateRun& operator=(const StateRun&) = delete;
     StateRun(StateRun&&) = delete;
@@ -773,9 +828,16 @@ public:
 
     void start_compositor() {
         std::vector<std::string> arguments{"--display", std::format("{}x{}", scene_.width, scene_.height), "--no-input"};
-        if (release_) {
+        if (options_.release) {
             arguments.emplace_back("--release");
-            arguments.emplace_back(release_policy_name(*release_));
+            arguments.emplace_back(release_policy_name(*options_.release));
+        }
+        if (options_.redraw) {
+            arguments.emplace_back("--redraw");
+            arguments.emplace_back(redraw_mode_name(*options_.redraw));
+        }
+        if (options_.verify_redraw) {
+            arguments.emplace_back("--verify-redraw");
         }
         compositor_ = spawn("compositor", executables_.compositor, arguments, frames_file_.fd().get(), UniqueFd{});
     }
@@ -839,7 +901,8 @@ public:
             check_alive();
             if (Clock::now() >= deadline) {
                 throw std::runtime_error{std::format(
-                    "compositor printed {} complete 'frames' and 'reveals' line pair(s) after two SIGUSR1, expected 2",
+                    "compositor printed {} complete 'frames', 'reveals', 'gpu' and 'verify' line group(s) after two SIGUSR1, "
+                    "expected 2",
                     frames.size())};
             }
             std::this_thread::sleep_for(kPollStep);
@@ -899,9 +962,38 @@ private:
             if (!reveal_count || !reveal_total || !reveal_max) {
                 throw std::runtime_error{"compositor printed a malformed 'reveals' line"};
             }
+            const std::size_t gpu_end{content.find('\n', start)};
+            if (gpu_end == std::string_view::npos) {
+                return frames;
+            }
+            const auto gpu_tokens{split_whitespace(content.substr(start, gpu_end - start))};
+            start = gpu_end + 1;
+            if (gpu_tokens.empty() || gpu_tokens.front() != "gpu") {
+                throw std::runtime_error{"compositor printed no 'gpu' line after a 'reveals' line"};
+            }
+            const auto gpu_total{gpu_tokens.size() == kGpuLineTokens ? parse_number<std::uint64_t>(gpu_tokens.at(1)) : std::nullopt};
+            if (!gpu_total) {
+                throw std::runtime_error{"compositor printed a malformed 'gpu' line"};
+            }
+            const std::size_t verify_end{content.find('\n', start)};
+            if (verify_end == std::string_view::npos) {
+                return frames;
+            }
+            const auto verify_tokens{split_whitespace(content.substr(start, verify_end - start))};
+            start = verify_end + 1;
+            if (verify_tokens.empty() || verify_tokens.front() != "verify") {
+                throw std::runtime_error{"compositor printed no 'verify' line after a 'gpu' line"};
+            }
+            const auto verify_checked{verify_tokens.size() == kVerifyLineTokens ? parse_number<std::uint64_t>(verify_tokens.at(1)) : std::nullopt};
+            const auto verify_mismatched{verify_tokens.size() == kVerifyLineTokens ? parse_number<std::uint64_t>(verify_tokens.at(2)) : std::nullopt};
+            if (!verify_checked || !verify_mismatched) {
+                throw std::runtime_error{"compositor printed a malformed 'verify' line"};
+            }
             frames.push_back(Telemetry{FrameCount{*count},
                                        RevealTotals{RevealCount{*reveal_count}, Microseconds{*reveal_total},
-                                                    Microseconds{*reveal_max}}});
+                                                    Microseconds{*reveal_max}},
+                                       Microseconds{*gpu_total},
+                                       VerifyTotals{FrameCount{*verify_checked}, FrameCount{*verify_mismatched}}});
         }
     }
 
@@ -995,7 +1087,7 @@ private:
 
     const Executables& executables_;
     const Scene& scene_;
-    std::optional<ReleasePolicy> release_;
+    const Options& options_;
     TempFile frames_file_{"bench-frames"};
     std::unique_ptr<Child> compositor_;
     std::vector<std::unique_ptr<Child>> clients_;
@@ -1008,7 +1100,7 @@ double cpu_percent(CpuTime cpu, Seconds interval) {
 StateResult run_state(const StateSpec& state, const Options& options, const Executables& executables,
                       const Scene& scene, const Timebase& timebase) {
     std::cerr << std::format("bench: state {}: starting compositor and {} client(s)\n", state.name, options.clients);
-    StateRun run{executables, scene, options.release};
+    StateRun run{executables, scene, options};
     run.start_compositor();
     for (std::size_t index{0}; index < options.clients; ++index) {
         check_stop();
@@ -1035,6 +1127,15 @@ StateResult run_state(const StateSpec& state, const Options& options, const Exec
     if (after.reveals.count.value < before.reveals.count.value || after.reveals.total.value < before.reveals.total.value) {
         throw std::runtime_error{"compositor reveal count or total time decreased between the two 'reveals' lines"};
     }
+    if (after.gpu.value < before.gpu.value) {
+        throw std::runtime_error{"compositor GPU time decreased between the two 'gpu' lines"};
+    }
+    if (after.verify.checked.value < before.verify.checked.value ||
+        after.verify.mismatched.value < before.verify.mismatched.value) {
+        throw std::runtime_error{"compositor verify counts decreased between the two 'verify' lines"};
+    }
+    const std::uint64_t frame_count{after.frames.value - before.frames.value};
+    const std::uint64_t gpu_total{after.gpu.value - before.gpu.value};
     const std::uint64_t reveal_count{after.reveals.count.value - before.reveals.count.value};
     const std::uint64_t reveal_total{after.reveals.total.value - before.reveals.total.value};
     const Seconds sample_interval{second_sample - first_sample};
@@ -1045,7 +1146,12 @@ StateResult run_state(const StateSpec& state, const Options& options, const Exec
         .client_footprint = second.clients.footprint,
         .compositor_cpu_percent = cpu_percent(second.compositor.cpu - first.compositor.cpu, sample_interval),
         .client_cpu_percent = cpu_percent(second.clients.cpu - first.clients.cpu, sample_interval),
-        .frames_per_second = static_cast<double>(after.frames.value - before.frames.value) / frame_interval.count(),
+        .frames_per_second = static_cast<double>(frame_count) / frame_interval.count(),
+        .gpu_ms_per_frame = frame_count == 0 ? std::nullopt
+                                             : std::optional{static_cast<double>(gpu_total) /
+                                                             static_cast<double>(frame_count) / kMicrosecondsPerMillisecond},
+        .frames_checked = FrameCount{after.verify.checked.value - before.verify.checked.value},
+        .frames_mismatched = FrameCount{after.verify.mismatched.value - before.verify.mismatched.value},
         .reveals_per_second = static_cast<double>(reveal_count) / frame_interval.count(),
         .reveal_mean_ms = reveal_count == 0 ? std::nullopt
                                             : std::optional{static_cast<double>(reveal_total) /
@@ -1058,6 +1164,10 @@ StateResult run_state(const StateSpec& state, const Options& options, const Exec
 
 std::string milliseconds_cell(std::optional<double> value) {
     return value ? std::format("{:.2f}", *value) : std::string{"-"};
+}
+
+std::string gpu_cell(std::optional<double> value) {
+    return value ? std::format("{:.3f}", *value) : std::string{"-"};
 }
 
 double megabytes(Bytes bytes) { return static_cast<double>(bytes.value) / kBytesPerMegabyte; }
@@ -1081,18 +1191,32 @@ std::string render(const Facts& facts, const Scene& scene, const Options& option
     out += std::format("- Windows: {} ({} mapped)\n", scene.windows, scene.mapped);
     out += std::format("- Client processes: {}\n", options.clients);
     out += std::format("- Buffer release: {}\n", options.release ? release_policy_name(*options.release) : "default");
+    out += std::format("- Redraw: {}\n", options.redraw ? redraw_mode_name(*options.redraw) : "default");
+    if (options.verify_redraw) {
+        out += "- Redraw verification: on\n";
+    }
     out += std::format("- Settle: {:g} s, measure: {:g} s\n\n", options.settle.count(), options.measure.count());
     out += "| State | Compositor footprint (MB) | Client footprint (MB) | Total footprint (MB) "
-           "| Compositor CPU (%) | Client CPU (%) | Total CPU (%) | Frames/s "
-           "| Reveals/s | Reveal mean (ms) | Reveal max since start (ms) |\n";
-    out += "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+           "| Compositor CPU (%) | Client CPU (%) | Total CPU (%) | Frames/s | GPU (ms/frame) ";
+    std::string separator{"|---|---:|---:|---:|---:|---:|---:|---:|---:|"};
+    if (options.verify_redraw) {
+        out += "| Frames checked | Frames mismatched ";
+        separator += "---:|---:|";
+    }
+    out += "| Reveals/s | Reveal mean (ms) | Reveal max since start (ms) |\n";
+    out += separator;
+    out += "---:|---:|---:|\n";
     for (const StateResult& result : results) {
-        out += std::format("| {} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {} | {} |\n", result.name,
+        out += std::format("| {} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {} ", result.name,
                            megabytes(result.compositor_footprint), megabytes(result.client_footprint),
                            megabytes(Bytes{result.compositor_footprint.value + result.client_footprint.value}),
                            result.compositor_cpu_percent, result.client_cpu_percent,
                            result.compositor_cpu_percent + result.client_cpu_percent, result.frames_per_second,
-                           result.reveals_per_second, milliseconds_cell(result.reveal_mean_ms),
+                           gpu_cell(result.gpu_ms_per_frame));
+        if (options.verify_redraw) {
+            out += std::format("| {} | {} ", result.frames_checked.value, result.frames_mismatched.value);
+        }
+        out += std::format("| {:.1f} | {} | {} |\n", result.reveals_per_second, milliseconds_cell(result.reveal_mean_ms),
                            milliseconds_cell(result.reveal_max_ms));
     }
     return out;
@@ -1113,6 +1237,7 @@ int run(std::span<char*> argv) {
         results.push_back(run_state(state, options, executables, scene, timebase));
     }
 
+    bool mismatch{false};
     const std::string report_text{render(facts, scene, options, results)};
     std::cout << report_text << std::flush;
     if (!std::cout) {
@@ -1126,7 +1251,16 @@ int run(std::span<char*> argv) {
             throw std::runtime_error{std::format("failed to write {}", options.output->string())};
         }
     }
-    return 0;
+    if (options.verify_redraw) {
+        for (const StateResult& result : results) {
+            if (result.frames_mismatched.value > 0) {
+                std::cerr << std::format("bench: redraw verification failed: state {} had {} mismatched of {} checked frames\n",
+                                         result.name, result.frames_mismatched.value, result.frames_checked.value);
+                mismatch = true;
+            }
+        }
+    }
+    return mismatch ? kErrorExitCode : 0;
 }
 
 }  // namespace

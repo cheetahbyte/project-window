@@ -100,7 +100,7 @@ Each ends with something runnable and a number.
 1. **Windows on screen.** Server, `clientkit`, and `demo-client` showing several windows that can be raised and dragged. Full-frame redraw on any change.
 2. **Benchmark.** `bench` builds a scene from the captured desktop (228 windows with their real sizes, 20 visible), then records total footprint and CPU across the compositor and all clients in three states: idle, one window animating, one window being dragged. Results go to `docs/results/`.
 3. **Buffer policy.** The server tells clients when a window becomes hidden or fully covered. The client releases that buffer and redraws when the window is revealed. Re-run the benchmark. The compositor's `--release never|unmapped|occluded` option selects which windows count as hidden, and the benchmark's `reveal` state measures how long a client takes to supply a buffer again.
-4. **Damage and occlusion.** Redraw only the changed region, and skip windows fully covered by opaque ones. Re-run the benchmark.
+4. **Damage and occlusion.** Redraw only the changed region, and skip windows fully covered by opaque ones. Re-run the benchmark. Decided by measurement: the compositor presents its own pool of surfaces as layer contents and tracks per-surface stale regions, because Metal layer drawables do not keep their contents. `--redraw overdraw|full|damage` selects the mode and `--verify-redraw` checks partial frames against a full redraw.
 
 ## How results compare to the baseline
 

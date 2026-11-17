@@ -1,0 +1,9 @@
+# Small hand-written scene for quick checks; see capture-scene for the format.
+display 900 600 2
+0 0 900 600 1 -32768
+40 40 400 300 1 0
+500 300 300 200 0 0
+120 100 400 300 1 0
+300 200 64 64 0 0
+260 180 420 280 1 0
+0 0 900 24 1 24

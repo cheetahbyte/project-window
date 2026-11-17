@@ -2,6 +2,9 @@
 
 #import <Metal/Metal.h>
 
+#include "compositor/display.h"
+#include "compositor/occlusion.h"
+#include "compositor/region.h"
 #include "compositor/scene.h"
 #include "protocol/transport.h"
 
@@ -29,12 +32,6 @@ enum class ReleasePolicy {
     Occluded,
 };
 
-struct DisplaySize {
-    std::int32_t width{};
-    std::int32_t height{};
-    friend bool operator==(const DisplaySize&, const DisplaySize&) = default;
-};
-
 // Time from telling a client its window is visible again until its first commit after that.
 struct RevealStats {
     std::uint64_t count{};
@@ -55,10 +52,16 @@ public:
 
     const Scene& scene() const { return scene_; }
     id<MTLTexture> texture(WindowKey key) const;
+    // The window's buffer if the window is drawn, otherwise nil. Drawn windows are opaque
+    // and hide what lies below them.
+    id<MTLTexture> drawn_texture(const Window& window) const;
 
     void pointer(PointerPhase phase, float x, float y);
-    // In points; call when the display is created and whenever its size changes.
-    void set_display_size(DisplaySize size);
+    // Call when the display is created and whenever its size or scale changes.
+    void set_display(Display display);
+    const std::optional<Display>& display() const { return display_; }
+    // What changed on the display since the last call, in display pixels.
+    [[nodiscard]] Region take_damage();
     const RevealStats& reveal_stats() const { return reveals_; }
 
 private:
@@ -97,7 +100,9 @@ private:
     void handle_pointer(PointerPhase phase, float x, float y);
     void update_visibility();
     std::vector<VisibilityChange> recompute_visibility();
-    bool shows(const Window& window, const std::vector<Rect>& occluders) const;
+    bool shows(const Window& window, const Occlusion& occlusion) const;
+    void damage_pixels(const Rect& rect);
+    void damage_if_drawn(const Window& window);
 
     id<MTLDevice> device_;
     ReleasePolicy policy_;
@@ -112,7 +117,8 @@ private:
     std::optional<Drag> drag_;
     std::optional<WindowKey> pointer_target_;
     // Unknown until the display reports its size; visibility is not computed before that.
-    std::optional<DisplaySize> display_;
+    std::optional<Display> display_;
+    Region damage_;
     bool visibility_dirty_{false};
     RevealStats reveals_;
 

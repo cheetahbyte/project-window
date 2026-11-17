@@ -1,7 +1,8 @@
 #import <AppKit/AppKit.h>
-#import <MetalKit/MetalKit.h>
-#import <simd/simd.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 
+#import "compositor/renderer.h"
 #import "compositor/server.h"
 
 #include <dispatch/dispatch.h>
@@ -13,6 +14,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -50,10 +52,19 @@ std::optional<pw::ReleasePolicy> parse_release(std::string_view text) {
     return std::nullopt;
 }
 
+std::optional<pw::RedrawMode> parse_redraw(std::string_view text) {
+    if (text == "overdraw") return pw::RedrawMode::Overdraw;
+    if (text == "full") return pw::RedrawMode::Full;
+    if (text == "damage") return pw::RedrawMode::Damage;
+    return std::nullopt;
+}
+
 struct Options {
     std::optional<pw::DisplaySize> display;
     std::optional<pw::ReleasePolicy> release;
+    std::optional<pw::RedrawMode> redraw;
     bool input{true};
+    bool verify_redraw{false};
 };
 
 std::optional<Options> parse_options(std::span<char* const> arguments) {
@@ -62,6 +73,10 @@ std::optional<Options> parse_options(std::span<char* const> arguments) {
         const std::string_view argument{arguments[index]};
         if (argument == "--no-input") {
             options.input = false;
+            continue;
+        }
+        if (argument == "--verify-redraw") {
+            options.verify_redraw = true;
             continue;
         }
         if (index + 1 >= arguments.size()) return std::nullopt;
@@ -73,6 +88,9 @@ std::optional<Options> parse_options(std::span<char* const> arguments) {
         } else if (argument == "--release" && !options.release) {
             options.release = parse_release(value);
             if (!options.release) return std::nullopt;
+        } else if (argument == "--redraw" && !options.redraw) {
+            options.redraw = parse_redraw(value);
+            if (!options.redraw) return std::nullopt;
         } else {
             return std::nullopt;
         }
@@ -91,6 +109,13 @@ pw::DisplaySize display_size_of(NSSize size) {
     return {.width = whole_points(size.width), .height = whole_points(size.height)};
 }
 
+// macOS backing scales are whole numbers; anything else is rounded to the nearest one.
+std::int32_t whole_scale(CGFloat scale) {
+    if (!(scale >= 1)) return 1;
+    return static_cast<std::int32_t>(
+        std::lround(std::min(scale, static_cast<CGFloat>(pw::kMaxDisplayScale))));
+}
+
 // Keeps the dispatch source alive and running for as long as the returned object lives.
 dispatch_source_t watch_signal(int signal_number, dispatch_block_t handler) {
     // The source only observes the signal; the default action would otherwise still run.
@@ -104,109 +129,77 @@ dispatch_source_t watch_signal(int signal_number, dispatch_block_t handler) {
     return source;
 }
 
-struct QuadUniforms {
-    simd_float4 rect{};
-    simd_float2 display{};
-};
-
-id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> device) {
-    NSURL* url = [NSBundle.mainBundle.executableURL.URLByDeletingLastPathComponent
-        URLByAppendingPathComponent:@"composite.metallib"];
-    NSError* error = nil;
-    id<MTLLibrary> library = [device newLibraryWithURL:url error:&error];
-    if (!library) {
-        std::fprintf(stderr, "compositor: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-    MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
-    descriptor.vertexFunction = [library newFunctionWithName:@"quad_vertex"];
-    descriptor.fragmentFunction = [library newFunctionWithName:@"quad_fragment"];
-    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor
-                                                                                 error:&error];
-    if (!pipeline) std::fprintf(stderr, "compositor: %s\n", error.localizedDescription.UTF8String);
-    return pipeline;
-}
-
 }  // namespace
 
-// Stands in for the display: draws the scene and feeds pointer events to the server.
-@interface DisplayView : MTKView <MTKViewDelegate>
+// Stands in for the display: shows the renderer's frames and feeds pointer events to the server.
+@interface DisplayView : NSView
 - (instancetype)initWithFrame:(NSRect)frame
                        server:(pw::Server*)server
-                     pipeline:(id<MTLRenderPipelineState>)pipeline;
-@property(readonly) std::uint64_t framesPresented;
+                     renderer:(pw::Renderer*)renderer;
+// Asks for a frame at the next display refresh.
+- (void)requestFrame;
 // When NO, pointer events are swallowed so a stray click cannot disturb a measurement.
 @property BOOL inputEnabled;
 @end
 
 @implementation DisplayView {
     pw::Server* _server;
-    id<MTLRenderPipelineState> _pipeline;
-    id<MTLCommandQueue> _queue;
-    std::uint64_t _framesPresented;
+    pw::Renderer* _renderer;
+    CADisplayLink* _link;
 }
-
-@synthesize framesPresented = _framesPresented;
 
 - (instancetype)initWithFrame:(NSRect)frame
                        server:(pw::Server*)server
-                     pipeline:(id<MTLRenderPipelineState>)pipeline {
-    self = [super initWithFrame:frame device:pipeline.device];
+                     renderer:(pw::Renderer*)renderer {
+    self = [super initWithFrame:frame];
     if (!self) return nil;
     _server = server;
-    _pipeline = pipeline;
-    _queue = [pipeline.device newCommandQueue];
-    _framesPresented = 0;
+    _renderer = renderer;
     _inputEnabled = YES;
-    _server->set_display_size(display_size_of(self.bounds.size));
-    self.delegate = self;
-    // Draw only when the server reports damage, never on a timer.
-    self.paused = YES;
-    self.enableSetNeedsDisplay = YES;
-    self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    self.clearColor = MTLClearColorMake(0.10, 0.11, 0.13, 1.0);
+    CALayer* layer = [CALayer layer];
+    layer.contentsGravity = kCAGravityTopLeft;
+    layer.opaque = YES;
+    // Hosting the layer, rather than backing the view with it, keeps AppKit from drawing into it.
+    self.layer = layer;
+    self.wantsLayer = YES;
+    // Paused whenever no frame is owed, so a static scene schedules nothing.
+    _link = [self displayLinkWithTarget:self selector:@selector(refresh:)];
+    _link.paused = YES;
+    [_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     return self;
+}
+
+- (void)requestFrame {
+    _link.paused = NO;
+}
+
+- (void)refresh:(CADisplayLink*)link {
+    if (_renderer->frame(*_server, self.layer) != pw::FrameOutcome::Deferred) link.paused = YES;
+}
+
+- (void)reportDisplay {
+    // Also reached from the superclass initialiser, before the server is set.
+    if (!_server || !self.window) return;
+    const CGFloat scale{self.window.backingScaleFactor};
+    self.layer.contentsScale = scale;
+    _server->set_display({.points = display_size_of(self.bounds.size),
+                          .pixels_per_point = whole_scale(scale)});
+    [self requestFrame];
 }
 
 - (void)setFrameSize:(NSSize)size {
     [super setFrameSize:size];
-    // Also called from the superclass initialiser, before the server is set.
-    if (_server) _server->set_display_size(display_size_of(self.bounds.size));
+    [self reportDisplay];
 }
 
-- (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self reportDisplay];
 }
 
-- (void)drawInMTKView:(MTKView*)view {
-    MTLRenderPassDescriptor* pass = view.currentRenderPassDescriptor;
-    id<CAMetalDrawable> drawable = view.currentDrawable;
-    if (!pass || !drawable) return;
-
-    id<MTLCommandBuffer> commands = [_queue commandBuffer];
-    id<MTLRenderCommandEncoder> encoder = [commands renderCommandEncoderWithDescriptor:pass];
-    [encoder setRenderPipelineState:_pipeline];
-
-    const CGSize display = view.bounds.size;
-    for (const pw::Window& window : _server->scene().back_to_front()) {
-        if (!window.mapped || !window.visible) continue;
-        id<MTLTexture> texture = _server->texture(window.key);
-        if (!texture) continue;
-        const QuadUniforms uniforms{
-            .rect = simd_make_float4(window.frame.x, window.frame.y, window.frame.width,
-                                     window.frame.height),
-            .display = simd_make_float2(static_cast<float>(display.width),
-                                        static_cast<float>(display.height)),
-        };
-        [encoder setVertexBytes:&uniforms length:sizeof uniforms atIndex:0];
-        [encoder setFragmentTexture:texture atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    }
-
-    [encoder endEncoding];
-    [commands presentDrawable:drawable];
-    [commands commit];
-    ++_framesPresented;
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    [self reportDisplay];
 }
 
 - (void)sendPointer:(pw::PointerPhase)phase event:(NSEvent*)event {
@@ -263,7 +256,8 @@ int main(int argc, char* argv[]) {
     if (!options) {
         std::fprintf(stderr,
                      "usage: compositor [--display WIDTHxHEIGHT] [--no-input] "
-                     "[--release never|unmapped|occluded]  (points, 1..%d)\n",
+                     "[--release never|unmapped|occluded] [--redraw overdraw|full|damage] "
+                     "[--verify-redraw]  (points, 1..%d)\n",
                      kMaxDisplayPoints);
         return kUsageExitStatus;
     }
@@ -283,12 +277,18 @@ int main(int argc, char* argv[]) {
         app.mainMenu = menu_bar;
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        id<MTLRenderPipelineState> pipeline = device ? make_pipeline(device) : nil;
-        if (!pipeline) return 1;
+        if (!device) {
+            std::fprintf(stderr, "compositor: no Metal device\n");
+            return 1;
+        }
+        const std::unique_ptr<pw::Renderer> renderer = pw::Renderer::create(
+            device, options->redraw.value_or(pw::RedrawMode::Damage), options->verify_redraw);
+        if (!renderer) return 1;
+        const pw::Renderer* const renderer_source{renderer.get()};
 
         DisplayView* view = nil;
         pw::Server server{device, options->release.value_or(pw::ReleasePolicy::Occluded),
-                          [&view] { view.needsDisplay = YES; }};
+                          [&view] { [view requestFrame]; }};
         const pw::Server* const stats_source{&server};
         if (const pw::Result<void> started = server.start(); !started) {
             const std::string service{pw::kServiceName};
@@ -311,7 +311,7 @@ int main(int argc, char* argv[]) {
                                             width, height);
             view = [[DisplayView alloc] initWithFrame:NSMakeRect(0, 0, width, height)
                                                server:&server
-                                             pipeline:pipeline];
+                                             renderer:renderer.get()];
             window = [[DisplayWindow alloc] initWithContentRect:frame
                                                       styleMask:NSWindowStyleMaskBorderless
                                                         backing:NSBackingStoreBuffered
@@ -320,7 +320,7 @@ int main(int argc, char* argv[]) {
             [window setFrame:frame display:NO];
         } else {
             const NSRect frame = NSMakeRect(0, 0, 1440, 900);
-            view = [[DisplayView alloc] initWithFrame:frame server:&server pipeline:pipeline];
+            view = [[DisplayView alloc] initWithFrame:frame server:&server renderer:renderer.get()];
             window = [[NSWindow alloc]
                 initWithContentRect:frame
                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -336,10 +336,15 @@ int main(int argc, char* argv[]) {
 
         dispatch_source_t frames_source = watch_signal(SIGUSR1, ^{
             const pw::RevealStats& reveals = stats_source->reveal_stats();
-            std::fprintf(stdout, "frames %" PRIu64 "\nreveals %" PRIu64 " %" PRId64 " %" PRId64 "\n",
-                         view.framesPresented, reveals.count,
+            const pw::RenderStats rendered = renderer_source->stats();
+            std::fprintf(stdout,
+                         "frames %" PRIu64 "\nreveals %" PRIu64 " %" PRId64 " %" PRId64
+                         "\ngpu %" PRId64 "\nverify %" PRIu64 " %" PRIu64 "\n",
+                         rendered.frames, reveals.count,
                          static_cast<std::int64_t>(reveals.total.count()),
-                         static_cast<std::int64_t>(reveals.max.count()));
+                         static_cast<std::int64_t>(reveals.max.count()),
+                         static_cast<std::int64_t>(rendered.gpu.count()), rendered.verified,
+                         rendered.mismatched);
             std::fflush(stdout);
         });
         dispatch_source_t terminate_source = watch_signal(SIGTERM, ^{
